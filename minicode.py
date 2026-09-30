@@ -8,6 +8,12 @@
   3. Boucle agent  -> on rappelle le modèle tant qu'il demande des outils.
 
 Lancer :  uv run minicode.py      (dans le dossier du projet à explorer)
+
+Deux "fournisseurs" de modèle, même boucle :
+  - ollama    (défaut, gratuit) : un modèle qui tourne sur ta machine. Ollama
+                parle le même format que l'API Anthropic, donc on garde le même
+                SDK en changeant juste l'adresse du serveur.
+  - anthropic (payant) : les modèles Claude, via ANTHROPIC_API_KEY.
 """
 
 import os
@@ -17,8 +23,11 @@ import anthropic
 
 from tools import TOOL_SCHEMAS, WORKSPACE, run_tool
 
-MODEL = os.environ.get("MINICODE_MODEL", "claude-opus-5-5")
-EFFORT = os.environ.get("MINICODE_EFFORT", "medium")  # low | medium | high | xhigh | max
+PROVIDER = os.environ.get("MINICODE_PROVIDER", "ollama")  # ollama | anthropic
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+DEFAULT_MODELS = {"ollama": "qwen3:8b", "anthropic": "claude-opus-5-5"}
+MODEL = os.environ.get("MINICODE_MODEL", DEFAULT_MODELS[PROVIDER])
+EFFORT = os.environ.get("MINICODE_EFFORT", "medium")  # anthropic seulement : low | medium | high | xhigh | max
 MAX_STEPS = 30  # garde-fou : nombre max d'appels au modèle pour UNE demande
 
 SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
@@ -30,14 +39,27 @@ Réponds de façon concise, en français."""
 DIM, CYAN, RED, RESET = "\033[2m", "\033[36m", "\033[31m", "\033[0m"
 
 
+def make_client():
+    if PROVIDER == "ollama":
+        # Le serveur local ne vérifie pas la clé, mais le SDK en exige une.
+        return anthropic.Anthropic(base_url=OLLAMA_URL, api_key="ollama")
+    return anthropic.Anthropic()  # lit ANTHROPIC_API_KEY dans l'environnement
+
+
 def call_model(client, messages):
     """UN appel au modèle. Tout le "cerveau" est là ; tout le reste est du harness."""
-    return client.beta.messages.create(
+    params = dict(
         model=MODEL,
         max_tokens=16000,
         system=SYSTEM_PROMPT,
         tools=TOOL_SCHEMAS,
         messages=messages,
+    )
+    if PROVIDER == "ollama":
+        # Ollama ne connaît que l'API de base (pas les options bêta ci-dessous).
+        return client.messages.create(**params)
+    return client.beta.messages.create(
+        **params,
         output_config={"effort": EFFORT},
         # Si un filtre de sécurité refuse la requête, l'API la rejoue sur un
         # autre modèle au lieu d'échouer (paramètre côté serveur, en bêta).
@@ -99,10 +121,10 @@ def run_turn(client, messages, user_input):
 
 
 def main():
-    client = anthropic.Anthropic()  # lit ANTHROPIC_API_KEY dans l'environnement
+    client = make_client()
     messages = []  # TOUT l'état de la conversation tient dans cette liste
 
-    print(f"minicode — modèle {MODEL}, projet {WORKSPACE}")
+    print(f"minicode — {PROVIDER} / {MODEL}, projet {WORKSPACE}")
     print("Tape ta demande (Ctrl-D ou 'exit' pour quitter).\n")
     while True:
         try:
@@ -123,7 +145,12 @@ def main():
             # Une erreur en plein tour laisse l'historique à moitié écrit (ex : un
             # tool_use sans son tool_result), que l'API refuserait ensuite. On annule.
             del messages[start:]
-            print(f"{RED}Erreur API : {e}. Demande annulée.{RESET}\n")
+            print(f"{RED}Erreur API : {e} Demande annulée.{RESET}")
+            if PROVIDER == "ollama" and isinstance(e, anthropic.APIConnectionError):
+                print(f"{RED}Ollama ne répond pas sur {OLLAMA_URL} : lance `ollama serve`.{RESET}")
+            elif PROVIDER == "ollama" and isinstance(e, anthropic.NotFoundError):
+                print(f"{RED}Modèle absent : lance `ollama pull {MODEL}`.{RESET}")
+            print()
 
 
 if __name__ == "__main__":

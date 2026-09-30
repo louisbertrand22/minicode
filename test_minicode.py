@@ -23,7 +23,8 @@ class FakeClient:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.requests = []
-        self.beta = NS(messages=NS(create=self._create))
+        self.messages = NS(create=self._create)           # API de base (Ollama)
+        self.beta = NS(messages=NS(create=self._create))  # API bêta (Anthropic)
 
     def _create(self, **kwargs):
         self.requests.append({**kwargs, "messages": list(kwargs["messages"])})
@@ -69,6 +70,26 @@ def test_refusal_rolls_back_turn():
     out = minicode.run_turn(client, messages, "demande refusée")
     assert "refusal" in out
     assert len(messages) == 2  # l'historique est revenu à son état d'avant
+
+
+def test_ollama_gets_only_basic_params(monkeypatch):
+    monkeypatch.setattr(minicode, "PROVIDER", "ollama")
+    client = FakeClient(NS(stop_reason="end_turn", content=[text("ok")]))
+    minicode.run_turn(client, [], "salut")
+    assert "betas" not in client.requests[0] and "output_config" not in client.requests[0]
+
+
+def test_anthropic_gets_effort_and_fallbacks(monkeypatch):
+    monkeypatch.setattr(minicode, "PROVIDER", "anthropic")
+    client = FakeClient(NS(stop_reason="end_turn", content=[text("ok")]))
+    minicode.run_turn(client, [], "salut")
+    assert client.requests[0]["fallbacks"] == "default"
+    assert client.requests[0]["output_config"] == {"effort": minicode.EFFORT}
+
+
+def test_ollama_client_points_to_local_server(monkeypatch):
+    monkeypatch.setattr(minicode, "PROVIDER", "ollama")
+    assert str(minicode.make_client().base_url).startswith("http://localhost:11434")
 
 
 def test_unknown_tool_is_reported_as_error():
