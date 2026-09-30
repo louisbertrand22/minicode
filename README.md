@@ -10,15 +10,35 @@ Le modèle tourne sur ta machine : pas de clé, pas de frais.
 
 ```bash
 sudo pacman -S ollama-cuda                 # Arch + carte NVIDIA (sinon : https://ollama.com/download)
-OLLAMA_CONTEXT_LENGTH=16384 ollama serve   # dans un terminal à part, laisse-le tourner
+OLLAMA_CONTEXT_LENGTH=8192 ollama serve    # dans un terminal à part, laisse-le tourner
 ollama pull qwen3:8b                       # ~5 Go, une seule fois
 uv run minicode.py                         # dans un autre terminal
+```
+
+Sans sudo : l'archive officielle s'installe dans ton dossier perso.
+
+```bash
+mkdir -p ~/.local/ollama
+curl -fL -C - -o /tmp/ollama.tar.zst https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64.tar.zst
+tar --zstd -xf /tmp/ollama.tar.zst -C ~/.local/ollama
+export PATH="$HOME/.local/ollama/bin:$PATH"   # à ajouter dans ~/.zshrc
 ```
 
 ⚠️ **`OLLAMA_CONTEXT_LENGTH` est important.** Avec moins de 24 Go de VRAM, Ollama limite
 le contexte à 4k tokens par défaut, et **coupe l'historique en silence** quand ça déborde :
 le modèle "oublie" alors le début de la conversation ou les résultats d'outils.
-Vérifie avec `ollama ps`. Si c'est trop lent (le modèle déborde sur le CPU), essaie `8192`.
+
+Plus de contexte = plus de VRAM. Mesuré avec `qwen3:8b` sur une RTX 5060 (8 Go), même
+test de 3 questions :
+
+| Contexte | Mémoire | Réparti CPU/GPU | Durée |
+|---|---|---|---|
+| 8192  | 6,6 Go | 11 % / 89 % | 42 s |
+| 16384 | 7,8 Go | 24 % / 76 % | 77 s |
+
+Vérifie la répartition avec `ollama ps`. 8k suffit pour les étapes 1–3 ; il deviendra
+trop petit quand l'agent lira de gros fichiers : c'est exactement le problème que
+l'étape 8 (gestion du contexte) apprend à résoudre.
 
 Autres modèles qui savent utiliser des outils : `qwen3:4b` (plus léger),
 `qwen3-coder:30b` (bien meilleur en code, mais ~19 Go : lent sur 8 Go de VRAM).
