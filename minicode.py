@@ -6,6 +6,8 @@
   2. Un outil      -> le modèle *demande* un appel (bloc tool_use), on l'exécute,
                       on renvoie un bloc tool_result.
   3. Boucle agent  -> on rappelle le modèle tant qu'il demande des outils.
+  4. Outils qui AGISSENT : grep, edit_file, bash (l'agent peut modifier et vérifier).
+  5. Permissions (début) -> le harness demande "o/N" avant edit_file et bash.
 
 Lancer :  uv run minicode.py      (dans le dossier du projet à explorer)
 
@@ -21,7 +23,7 @@ import sys
 
 import anthropic
 
-from tools import TOOL_SCHEMAS, WORKSPACE, run_tool
+from tools import DANGEROUS_TOOLS, TOOL_SCHEMAS, WORKSPACE, run_tool
 
 PROVIDER = os.environ.get("MINICODE_PROVIDER", "ollama")  # ollama | anthropic
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -29,14 +31,29 @@ DEFAULT_MODELS = {"ollama": "qwen3:8b", "anthropic": "claude-opus-5-5"}
 MODEL = os.environ.get("MINICODE_MODEL", DEFAULT_MODELS[PROVIDER])
 EFFORT = os.environ.get("MINICODE_EFFORT", "medium")  # anthropic seulement : low | medium | high | xhigh | max
 MAX_STEPS = 30  # garde-fou : nombre max d'appels au modèle pour UNE demande
+# MINICODE_YOLO=1 : accepte tout sans demander (comme le mode sans permissions de
+# Claude Code). Pratique pour les tests automatiques, dangereux sur un vrai projet.
+YOLO = os.environ.get("MINICODE_YOLO") == "1"
 
 SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
 Tu travailles dans le projet situé à : {WORKSPACE}
-Utilise les outils pour explorer le code avant de répondre ; ne devine pas le contenu d'un fichier.
+
+Méthode :
+- Explore avant de répondre : grep pour trouver où est quelque chose, read_file pour le lire. Ne devine jamais le contenu d'un fichier.
+- Avant de modifier un fichier avec edit_file, lis-le. Fais des modifications petites et ciblées.
+- Après une modification, vérifie ton travail avec bash (par exemple en lançant les tests).
+- L'utilisateur peut refuser une action : dans ce cas, ne la retente pas, demande-lui comment procéder.
+
 Réponds de façon concise, en français."""
 
 # Couleurs ANSI, pour distinguer ce que fait le harness de ce que dit le modèle.
-DIM, CYAN, RED, RESET = "\033[2m", "\033[36m", "\033[31m", "\033[0m"
+DIM, CYAN, RED, GREEN, YELLOW, RESET = "\033[2m", "\033[36m", "\033[31m", "\033[32m", "\033[33m", "\033[0m"
+
+REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui comment il veut procéder."
+# Les petits modèles finissent parfois leur tour avec seulement de la réflexion
+# (bloc thinking) : ni outil, ni texte. Le harness les relance une fois.
+NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
+MAX_NUDGES = 1
 
 
 def make_client():
@@ -68,13 +85,52 @@ def call_model(client, messages):
     )
 
 
-def run_turn(client, messages, user_input):
+def _short(tool_input, limit=60):
+    """Version courte des arguments, pour la ligne grise `→ outil(...)`."""
+    parts = []
+    for key, value in tool_input.items():
+        value = repr(value)
+        parts.append(f"{key}={value[:limit] + '…' if len(value) > limit else value}")
+    return ", ".join(parts)
+
+
+def _preview(name, tool_input, max_lines=15):
+    """Montre à l'utilisateur ce que l'outil VA faire, avant qu'il le fasse."""
+    if name == "bash":
+        return f"{YELLOW}  $ {tool_input['command']}{RESET}"
+    if name == "edit_file":
+        lines = [f"{YELLOW}  fichier : {tool_input['path']}{RESET}"]
+        for prefix, color, key in (("-", RED, "old_string"), ("+", GREEN, "new_string")):
+            text_lines = tool_input[key].splitlines()
+            lines += [f"{color}  {prefix} {line}{RESET}" for line in text_lines[:max_lines]]
+            if len(text_lines) > max_lines:
+                lines.append(f"{DIM}  ... ({len(text_lines) - max_lines} lignes de plus){RESET}")
+        return "\n".join(lines)
+    return f"  {tool_input}"
+
+
+def ask_permission(name, tool_input):
+    """ÉTAPE 5 (début) : c'est le harness, pas le modèle, qui décide si une action a lieu."""
+    print(_preview(name, tool_input))
+    if YOLO:
+        print(f"{DIM}  (MINICODE_YOLO=1 : accepté automatiquement){RESET}")
+        return True
+    try:
+        answer = input(f"{YELLOW}  Autoriser {name} ? [o/N] {RESET}")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("o", "oui", "y", "yes")
+
+
+def run_turn(client, messages, user_input, confirm=ask_permission):
     """Traite une demande utilisateur : la BOUCLE D'AGENT (étape 3).
 
     Modifie `messages` sur place. Renvoie le texte final du modèle.
+    `confirm(name, input) -> bool` est appelé avant chaque outil dangereux.
     """
     turn_start = len(messages)
     messages.append({"role": "user", "content": user_input})
+    nudges = 0
 
     for step in range(MAX_STEPS):
         response = call_model(client, messages)
@@ -97,8 +153,13 @@ def run_turn(client, messages, user_input):
                 text_parts.append(block.text)
             elif block.type == "tool_use":
                 # Le modèle DEMANDE un outil ; c'est nous qui l'exécutons.
-                print(f"{DIM}  → {block.name}({block.input}){RESET}")
-                result, is_error = run_tool(block.name, block.input)
+                print(f"{DIM}  → {block.name}({_short(block.input)}){RESET}")
+                if block.name in DANGEROUS_TOOLS and not confirm(block.name, block.input):
+                    # Refus : on ne l'exécute pas, mais on DOIT quand même renvoyer
+                    # un tool_result, sinon l'API rejette l'historique.
+                    result, is_error = REFUSED, True
+                else:
+                    result, is_error = run_tool(block.name, block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,  # relie le résultat à la demande
@@ -107,8 +168,14 @@ def run_turn(client, messages, user_input):
                 })
 
         if response.stop_reason != "tool_use":
+            if not text_parts and nudges < MAX_NUDGES:
+                # Réponse vide : on relance au lieu de laisser l'utilisateur sans rien.
+                nudges += 1
+                print(f"{DIM}  (réponse vide, minicode relance le modèle){RESET}")
+                messages.append({"role": "user", "content": NUDGE})
+                continue
             # Le modèle n'a plus besoin d'outils : la demande est terminée.
-            return "\n".join(text_parts)
+            return "\n".join(text_parts) or f"{DIM}(le modèle n'a rien répondu){RESET}"
 
         # Texte intermédiaire éventuel ("je vais regarder le fichier X...").
         if text_parts:

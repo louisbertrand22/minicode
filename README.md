@@ -74,13 +74,33 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 1. REPL de chat (historique complet renvoyé à chaque appel)
 - [x] 2. Outils `read_file` / `list_dir` (schéma + exécution + erreurs `is_error`)
 - [x] 3. Boucle d'agent (plusieurs appels d'outils, en parallèle, limite `MAX_STEPS`)
-- [ ] 4. Outils d'écriture : `grep`, `edit_file` (remplacement exact), `bash`
-- [ ] 5. Permissions : demander o/n avant `bash` et les écritures, liste d'autorisations
+- [x] 4. Outils qui agissent : `grep`, `edit_file` (remplacement exact), `bash` (+ relance si réponse vide)
+- [~] 5. Permissions : o/N avant `bash` et `edit_file` ✅ — reste : liste d'autorisations (« toujours autoriser `pytest` »)
 - [ ] 6. Contexte projet : charger un `AGENTS.md` dans le prompt système
 - [ ] 7. Streaming + journal JSONL de chaque requête/réponse (le plus instructif !)
 - [ ] 8. Gestion du contexte : compter les tokens, résumer les vieux tours
 - [ ] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte
 - [ ] 10. Évals : 10 petites tâches, score de réussite / nombre de tours / coût
+
+## Étapes 4–5 : l'agent agit, le harness contrôle
+
+- `grep` évite de lire tous les fichiers ; `edit_file` remplace un texte **exact** (le modèle
+  n'écrit que ce qui change, et une erreur de recopie est détectée au lieu d'abîmer le fichier) ;
+  `bash` renvoie la sortie **et le code de sortie**, ce qui permet à l'agent de vérifier son travail.
+- Avant `edit_file` et `bash`, minicode montre ce qui va se passer et demande `o/N`.
+  Un refus n'exécute rien, mais renvoie quand même un `tool_result` au modèle (sinon l'API
+  rejette l'historique) avec la consigne de ne pas réessayer.
+- `MINICODE_YOLO=1` accepte tout sans demander. Pratique pour les tests, dangereux ailleurs.
+
+**Défi testé avec qwen3:8b** : sur un `calc.py` où `add` soustrait, la demande
+« lance les tests ; si un test échoue, corrige le bug et relance » donne
+`bash → grep → read_file → edit_file → bash` et des tests verts, sans aide.
+
+**Exercices :**
+- Crée un petit projet avec un bug et refais le défi. Refuse l'`edit_file` : que dit le modèle ?
+- Demande « supprime tous les fichiers .txt ». Lis bien la commande avant de répondre `o` !
+- Mets `MAX_NUDGES = 0` et répète une demande de correction plusieurs fois : combien de
+  réponses vides obtiens-tu ?
 
 ## Exercices pour les étapes 1–3
 

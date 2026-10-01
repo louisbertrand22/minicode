@@ -94,3 +94,89 @@ def test_ollama_client_points_to_local_server(monkeypatch):
 
 def test_unknown_tool_is_reported_as_error():
     assert tools.run_tool("rm_rf", {}) == ("Outil inconnu : rm_rf", True)
+
+
+# --- Étape 4 : les outils qui agissent ---------------------------------------
+
+def test_grep_finds_lines_and_skips_ignored_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\ndef run():\n    pass\n")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "lib.py").write_text("def run(): ...\n")
+    assert tools.run_tool("grep", {"pattern": r"def run", "path": "."}) == ("a.py:2: def run():", False)
+    assert tools.run_tool("grep", {"pattern": "nope", "path": "."}) == ("Aucun résultat.", False)
+    assert tools.run_tool("grep", {"pattern": "(", "path": "."})[1] is True  # regex invalide
+
+
+def test_edit_file_create_replace_and_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    edit = lambda old, new: tools.run_tool("edit_file", {"path": "calc.py", "old_string": old, "new_string": new})
+
+    assert edit("", "def add(a, b):\n    return a - b\n") == ("Fichier créé : calc.py (2 lignes)", False)
+    assert edit("", "autre")[1] is True                     # le fichier existe déjà
+    assert edit("return a - b", "return a + b") == ("Modifié : calc.py", False)
+    assert (tmp_path / "calc.py").read_text() == "def add(a, b):\n    return a + b\n"
+    assert "introuvable" in edit("return a * b", "x")[0]     # old_string absent
+    (tmp_path / "calc.py").write_text("x = 1\nx = 1\n")
+    assert "2 fois" in edit("x = 1", "x = 2")[0]              # old_string ambigu
+
+
+def test_bash_returns_output_and_exit_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    assert tools.run_tool("bash", {"command": "echo salut"}) == ("salut\n[code de sortie : 0]", False)
+    out, is_error = tools.run_tool("bash", {"command": "ls fichier_absent"})
+    assert not is_error and "[code de sortie : 2]" in out  # échec de la commande ≠ erreur de l'outil
+    monkeypatch.setattr(tools, "BASH_TIMEOUT", 1)
+    assert "arrêtée après 1 s" in tools.run_tool("bash", {"command": "sleep 5"})[0]
+
+
+# --- Étape 5 (début) : les permissions -----------------------------------------
+
+def _edit_then_done():
+    return FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("t1", "edit_file", path="f.txt", old_string="", new_string="hi")]),
+        NS(stop_reason="end_turn", content=[text("fini")]),
+    )
+
+
+def test_refused_action_is_not_run_but_still_answered(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    asked = []
+    messages = []
+    minicode.run_turn(_edit_then_done(), messages, "crée f.txt", confirm=lambda name, inp: asked.append(name) or False)
+    assert asked == ["edit_file"]
+    assert not (tmp_path / "f.txt").exists()
+    result = messages[2]["content"][0]
+    assert result["tool_use_id"] == "t1" and result["is_error"] and result["content"] == minicode.REFUSED
+
+
+def test_accepted_action_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    minicode.run_turn(_edit_then_done(), [], "crée f.txt", confirm=lambda name, inp: True)
+    assert (tmp_path / "f.txt").read_text() == "hi"
+
+
+def test_safe_tools_never_ask(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("t1", "list_dir", path="."), tool_use("t2", "grep", pattern="x", path=".")]),
+        NS(stop_reason="end_turn", content=[text("ok")]),
+    )
+    minicode.run_turn(client, [], "explore", confirm=lambda name, inp: must_not_ask(name))
+
+
+def test_empty_answer_is_nudged_once():
+    thinking_only = NS(stop_reason="end_turn", content=[NS(type="thinking", thinking="add soustrait...")])
+    client = FakeClient(thinking_only, NS(stop_reason="end_turn", content=[text("Le bug est dans add.")]))
+    messages = []
+    assert minicode.run_turn(client, messages, "trouve le bug") == "Le bug est dans add."
+    assert messages[2] == {"role": "user", "content": minicode.NUDGE}
+
+    # Une seule relance : si le modèle reste muet, on s'arrête quand même.
+    client = FakeClient(thinking_only, thinking_only)
+    assert "rien répondu" in minicode.run_turn(client, [], "trouve le bug")
+    assert len(client.requests) == 2
+
+
+def must_not_ask(name):
+    raise AssertionError(f"{name} ne devrait pas demander la permission")
