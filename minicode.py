@@ -168,7 +168,7 @@ def run_turn(client, messages, user_input, confirm=ask_permission):
         text_parts = []
         tool_results = []
         for block in response.content:
-            if block.type == "text":
+            if block.type == "text" and block.text.strip():  # un texte d'espaces = pas de réponse
                 text_parts.append(block.text)
             elif block.type == "tool_use":
                 # Le modèle DEMANDE un outil ; c'est nous qui l'exécutons.

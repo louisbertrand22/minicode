@@ -47,6 +47,9 @@ def read_file(path: str) -> str:
     if not p.is_file():
         raise ToolError(f"Fichier introuvable : {path}")
     text = p.read_text(errors="replace")
+    if not text.strip():
+        # Un résultat vide est ambigu pour le modèle ; on le dit explicitement.
+        return "(fichier vide : pour l'écrire, utilise edit_file avec old_string='')"
     if len(text) > MAX_OUTPUT_CHARS:
         text = text[:MAX_OUTPUT_CHARS] + f"\n... [tronqué, {len(text)} caractères au total]"
     # Numéroter les lignes aide le modèle à citer / éditer précisément.
@@ -104,8 +107,10 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     if p.is_relative_to(WORKSPACE / PROTECTED_DIR):
         raise ToolError(f"{PROTECTED_DIR}/ est protégé : seul l'utilisateur peut modifier les réglages de minicode.")
     if old_string == "":
-        if p.exists():
-            raise ToolError(f"{path} existe déjà : donne un old_string pour le modifier.")
+        # Un fichier existant mais VIDE compte comme "à créer" : sinon aucun
+        # old_string ne peut jamais y être trouvé et le modèle reste bloqué.
+        if p.exists() and p.read_text().strip():
+            raise ToolError(f"{path} existe déjà et n'est pas vide : lis-le, puis donne un old_string pour le modifier.")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(new_string)
         return f"Fichier créé : {path} ({len(new_string.splitlines())} lignes)"

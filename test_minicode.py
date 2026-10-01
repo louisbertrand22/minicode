@@ -115,12 +115,28 @@ def test_edit_file_create_replace_and_errors(tmp_path, monkeypatch):
     edit = lambda old, new: tools.run_tool("edit_file", {"path": "calc.py", "old_string": old, "new_string": new})
 
     assert edit("", "def add(a, b):\n    return a - b\n") == ("Fichier créé : calc.py (2 lignes)", False)
-    assert edit("", "autre")[1] is True                     # le fichier existe déjà
+    assert edit("", "autre")[1] is True                     # le fichier existe déjà (et n'est pas vide)
     assert edit("return a - b", "return a + b") == ("Modifié : calc.py", False)
     assert (tmp_path / "calc.py").read_text() == "def add(a, b):\n    return a + b\n"
     assert "introuvable" in edit("return a * b", "x")[0]     # old_string absent
     (tmp_path / "calc.py").write_text("x = 1\nx = 1\n")
     assert "2 fois" in edit("x = 1", "x = 2")[0]              # old_string ambigu
+
+
+def test_existing_empty_file_can_be_written(tmp_path, monkeypatch):
+    # Bug trouvé en vrai : un jeu.py vide bloquait le modèle (ni création, ni remplacement possibles).
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "jeu.py").write_text("")
+    assert "fichier vide" in tools.run_tool("read_file", {"path": "jeu.py"})[0]
+    out = tools.run_tool("edit_file", {"path": "jeu.py", "old_string": "", "new_string": "print('jeu')\n"})
+    assert out == ("Fichier créé : jeu.py (1 lignes)", False)
+    assert (tmp_path / "jeu.py").read_text() == "print('jeu')\n"
+
+
+def test_whitespace_answer_counts_as_empty():
+    client = FakeClient(NS(stop_reason="end_turn", content=[text(" \n")]),
+                        NS(stop_reason="end_turn", content=[text("Voilà.")]))
+    assert minicode.run_turn(client, [], "fais-le") == "Voilà."
 
 
 def test_bash_returns_output_and_exit_code(tmp_path, monkeypatch):
