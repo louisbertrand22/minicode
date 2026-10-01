@@ -32,7 +32,7 @@ import time
 import anthropic
 
 import permissions
-from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, precheck, run_tool
+from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, precheck, run_tool, stop_all_sessions
 from tracelog import Trace
 from ui import TerminalUI, edit_diff
 
@@ -56,8 +56,10 @@ Méthode :
 - Avant de modifier un fichier avec edit_file, lis-le. Fais des modifications petites et ciblées.
 - Après une modification, vérifie ton travail avec bash (par exemple en lançant les tests).
 - Pour tester un programme interactif (input()) : lis-le d'abord avec read_file pour savoir quelles
-  questions il pose, puis passe les réponses dans le paramètre stdin de bash. Si le résultat est
-  aléatoire, choisis des saisies qui marchent quand même (ex : 1 à 100 pour un nombre à deviner).
+  questions il pose. Si tes réponses ne dépendent pas de ce qu'il affiche, passe-les toutes dans le
+  paramètre stdin de bash. Si elles en dépendent (jeu avec indices, nombre d'essais limité...),
+  utilise interactive_start puis interactive_send, une réponse à la fois, en lisant chaque réponse.
+  Lance les programmes Python avec python3, et utilise des chemins relatifs au projet.
 - Fais les vérifications toi-même au lieu de demander à l'utilisateur de les faire.
 - Ne modifie JAMAIS un programme juste pour qu'un test passe (par exemple en remplaçant une
   valeur aléatoire par une valeur fixe) : adapte le test, pas le programme.
@@ -178,6 +180,15 @@ def run_turn(client, messages, user_input, confirm=None, trace=None, ui=None):
     `confirm(name, input)` est appelé avant chaque outil dangereux ; il renvoie
     un booléen, ou (booléen, consigne de l'utilisateur).
     """
+    try:
+        return _agent_loop(client, messages, user_input, confirm, trace, ui)
+    finally:
+        # Quoi qu'il arrive (fin normale, erreur, Ctrl-C), on n'abandonne pas de
+        # programmes interactifs qui tourneraient encore en arrière-plan.
+        stop_all_sessions()
+
+
+def _agent_loop(client, messages, user_input, confirm, trace, ui):
     ui = ui or get_ui()
     confirm = confirm or (lambda name, tool_input: ask_permission(name, tool_input, ui))
     turn_start = len(messages)

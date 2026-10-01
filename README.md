@@ -229,7 +229,45 @@ saisie. Ce qu'on a appris en le testant avec qwen3:8b sur le jeu de devinette :
 | 3 | a remplacé le nombre aléatoire par `50` pour que son test passe | consigne : « ne modifie jamais un programme juste pour qu'un test passe ». Sans YOLO, la demande de permission t'aurait montré `+ number = 50` |
 | 4 | test réussi : `EOFError` → indice → relance avec plus de saisies → « Félicitations! », code 0 | — |
 
-Et à l'essai 4, son **résumé était inventé** (« 6 coups, 64 → Félicitations ») alors que le
+### Sessions interactives (`interactive_start` / `interactive_send`)
+
+Limite de `stdin` : toutes les réponses sont données **d'avance**. Avec un jeu qui répond
+« Plus grand ! » et limite à 7 essais, impossible d'adapter son coup suivant. Deux outils :
+
+- `interactive_start(command)` lance le programme dans un **pseudo-terminal** (sinon Python
+  garde ses `print()` en mémoire et la question n'arrive jamais) et renvoie ce qu'il affiche
+  jusqu'à ce qu'il **se taise 0,5 s** : c'est ainsi qu'on devine qu'il attend une saisie ;
+- `interactive_send(session_id, text)` tape une ligne et renvoie la réponse.
+
+`interactive_start` demande la permission (il exécute du code, mêmes règles que `bash`) ;
+`interactive_send` non (il tape dans un programme déjà autorisé). Les programmes encore
+ouverts sont tués à la fin de chaque demande, même après Ctrl-C.
+
+Essai réel avec qwen3:8b sur un jeu à 7 essais et 60 s :
+```
+⏺ Run(python3 jeu.py)
+⏺ Type(50 → session 1)   ⎿ Plus grand !
+⏺ Type(75 → session 1)   ⎿ Plus grand !
+⏺ Type(88 → session 1)   ⎿ Plus grand !
+⏺ Type(94 → session 1)   ⎿ Plus petit !
+⏺ Type(91 → session 1)   ⎿ Plus grand !
+⏺ Type(92 → session 1)   ⎿ Plus grand !
+⏺ Type(93 → session 1)   ⎿ Félicitations ! Vous avez trouvé le nombre.
+```
+Ce qu'il a fallu pour en arriver là :
+- au début, qwen3 **ignorait les nouveaux outils** et refaisait `bash` + `stdin`. La description
+  de `bash` disait « pour un programme qui pose des questions, donne les réponses dans stdin » :
+  elle l'envoyait au mauvais endroit. Corrigé, mais ça ne suffisait pas…
+- … ce qui a marché : **mettre les outils interactifs AVANT `bash` dans la liste**. Les petits
+  modèles sont sensibles à l'ordre des outils ;
+- un bug du harness : le programme ferme son affichage quelques millisecondes avant que son
+  processus disparaisse, et minicode disait « session toujours ouverte » après la victoire.
+
+Enfin, les notes du harness (`[indice minicode …]`, `[code de sortie …]`, `[session …]`)
+sont maintenant **toujours affichées** sous un résultat, même quand la sortie est coupée :
+tu vois ce que le harness dit au modèle.
+
+Et à l'essai 4 (stdin), son **résumé était inventé** (« 6 coups, 64 → Félicitations ») alors que le
 journal montre 2 coups, sur 75. Ne crois pas le récit de l'agent : vérifie avec le journal.
 
 ```bash

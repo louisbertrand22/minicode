@@ -48,9 +48,13 @@ def add_allow_rule(rule):
     rules_file().write_text(json.dumps(rules, indent=2, ensure_ascii=False) + "\n")
 
 
+# Outils qui exécutent une commande shell : leurs règles portent sur la commande.
+COMMAND_TOOLS = {"bash", "interactive_start"}
+
+
 def _target(name, tool_input):
     """Ce à quoi on compare le motif d'une règle."""
-    return tool_input["command"] if name == "bash" else tool_input.get("path", "")
+    return tool_input["command"] if name in COMMAND_TOOLS else tool_input.get("path", "")
 
 
 def matches(rule, name, tool_input):
@@ -64,7 +68,7 @@ def decide(name, tool_input, rules=None):
     for rule in rules["deny"]:
         if matches(rule, name, tool_input):
             return "deny", rule
-    if name == "bash" and SHELL_META.search(tool_input["command"]):
+    if name in COMMAND_TOOLS and SHELL_META.search(tool_input["command"]):
         return "ask", "commande composée : toujours demander"
     for rule in rules["allow"]:
         if matches(rule, name, tool_input):
@@ -83,4 +87,4 @@ def suggest_rule(name, tool_input):
 
 def can_remember(name, tool_input):
     """On ne propose pas « toujours » pour une commande composée (elle redemanderait quand même)."""
-    return not (name == "bash" and SHELL_META.search(tool_input["command"]))
+    return not (name in COMMAND_TOOLS and SHELL_META.search(tool_input["command"]))

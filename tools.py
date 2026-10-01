@@ -10,8 +10,15 @@ Le modèle n'exécute jamais rien lui-même : il renvoie un bloc `tool_use`
 décide de l'exécuter et de renvoyer le résultat.
 """
 
+import itertools
+import os
+import pty
 import re
+import select
+import signal
 import subprocess
+import termios
+import time
 from pathlib import Path
 
 # Racine du projet sur lequel l'agent travaille. Les outils de fichiers refusent
@@ -28,7 +35,8 @@ PROTECTED_DIR = ".minicode"
 
 # Outils qui modifient le disque ou exécutent du code : le harness demande la
 # permission à l'utilisateur avant de les lancer (voir minicode.py).
-DANGEROUS_TOOLS = {"edit_file", "bash"}
+DANGEROUS_TOOLS = {"edit_file", "bash", "interactive_start"}
+# interactive_send n'y est pas : il ne fait que taper dans un programme déjà autorisé.
 
 
 class ToolError(Exception):
@@ -140,6 +148,106 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     return message
 
 
+INTERACTIVE_IDLE = 0.5        # s sans nouvelle sortie => le programme attend sans doute une saisie
+INTERACTIVE_FIRST_OUTPUT = 3  # s d'attente max pour la toute première sortie
+INTERACTIVE_MAX_WAIT = 15     # s max par lecture (un programme qui parle sans arrêt ne bloque pas l'agent)
+MAX_SESSIONS = 3
+_sessions = {}                # id -> (processus, descripteur du pseudo-terminal)
+_next_id = itertools.count(1)
+
+
+def _read_until_idle(proc, fd):
+    """Lit ce qu'affiche le programme jusqu'à ce qu'il se taise (ou se termine).
+
+    Un programme ne prévient pas qu'il attend une saisie : on le DEVINE quand il
+    n'affiche plus rien pendant INTERACTIVE_IDLE secondes. C'est une heuristique,
+    comme dans tous les outils de ce genre (pexpect, tmux...).
+    """
+    chunks, start = [], time.time()
+    last = start
+    while time.time() - start < INTERACTIVE_MAX_WAIT:
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if ready:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:  # le programme est fini et le pseudo-terminal fermé
+                data = b""
+            if not data:
+                # L'affichage est fermé : le programme se termine. Son processus peut
+                # mettre quelques millisecondes à disparaître : on l'attend, sinon on
+                # dirait à tort « session toujours ouverte » (bug vu en vrai).
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+                break
+            chunks.append(data)
+            last = time.time()
+            continue
+        if proc.poll() is not None:
+            break
+        waited = time.time() - last
+        if (chunks and waited >= INTERACTIVE_IDLE) or waited >= INTERACTIVE_FIRST_OUTPUT:
+            break
+    text = b"".join(chunks).decode(errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _session_status(session_id):
+    proc, fd = _sessions[session_id]
+    if proc.poll() is None:
+        return (f"[session {session_id} toujours ouverte : le programme attend peut-être une saisie. "
+                f"Utilise interactive_send(session_id=\"{session_id}\", text=...)]")
+    os.close(fd)
+    del _sessions[session_id]
+    return f"[programme terminé, code de sortie : {proc.returncode}]"
+
+
+def interactive_start(command: str) -> str:
+    """Lance un programme dans un pseudo-terminal et renvoie ce qu'il affiche au début.
+
+    Pseudo-terminal : sans lui, Python (et bien d'autres) garde ses print() en
+    mémoire tant qu'il n'écrit pas dans un "vrai" terminal, et on ne verrait
+    jamais la question "Entrez un nombre :".
+    """
+    if len(_sessions) >= MAX_SESSIONS:
+        raise ToolError(f"Déjà {MAX_SESSIONS} sessions ouvertes : termine-les (ou attends la fin de la demande).")
+    master, slave = pty.openpty()
+    attrs = termios.tcgetattr(slave)
+    attrs[3] &= ~termios.ECHO  # le terminal ne répète pas ce qu'on tape : on sait déjà ce qu'on a envoyé
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    proc = subprocess.Popen(command, shell=True, cwd=WORKSPACE, stdin=slave, stdout=slave, stderr=slave,
+                            start_new_session=True)
+    os.close(slave)
+    session_id = str(next(_next_id))
+    _sessions[session_id] = (proc, master)
+    output = _read_until_idle(proc, master)
+    return _truncate(f"[session {session_id}]\n{output}\n{_session_status(session_id)}")
+
+
+def interactive_send(session_id: str, text: str) -> str:
+    """Tape une ligne dans un programme lancé par interactive_start, et renvoie sa réponse."""
+    if session_id not in _sessions:
+        raise ToolError(f"Session {session_id} inconnue ou déjà terminée. Relance le programme avec interactive_start.")
+    proc, fd = _sessions[session_id]
+    os.write(fd, (text + "\n").encode())
+    output = _read_until_idle(proc, fd)
+    return _truncate(f"{output}\n{_session_status(session_id)}")
+
+
+def stop_all_sessions():
+    """Arrête les programmes encore ouverts (appelé à la fin de chaque demande)."""
+    for proc, fd in _sessions.values():
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # tout le groupe : le shell ET le programme
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        os.close(fd)
+    _sessions.clear()
+
+
 def bash(command: str, stdin: str | None = None) -> str:
     """Lance une commande shell dans le dossier du projet.
 
@@ -166,8 +274,9 @@ def bash(command: str, stdin: str | None = None) -> str:
         else:
             output += (f"\n[indice minicode : le programme a demandé plus de saisies que les "
                        f"{len(stdin.splitlines())} lignes fournies dans stdin. Ce n'est pas un bug du "
-                       "programme. Relance TOI-MÊME bash avec assez de lignes pour aller jusqu'au bout "
-                       "(par exemple, pour un nombre à deviner entre 1 et 100 : les 100 valeurs, une par ligne).]")
+                       "programme. Si tes réponses dépendent de ce qu'il affiche, utilise interactive_start "
+                       "puis interactive_send (une réponse à la fois). Sinon, relance TOI-MÊME bash avec "
+                       "assez de lignes pour aller jusqu'au bout.]")
     # Le code de sortie est crucial : c'est grâce à lui que le modèle sait si
     # ses tests passent ou non.
     return _truncate(f"{output}\n[code de sortie : {r.returncode}]")
@@ -241,12 +350,49 @@ TOOL_SCHEMAS = [
         "strict": True,
     },
     {
+        "name": "interactive_start",
+        "description": (
+            "Lance un programme interactif (qui pose des questions avec input()) et renvoie ce qu'il "
+            "affiche jusqu'à sa première question, avec un numéro de session. Ensuite, réponds-lui ligne "
+            "par ligne avec interactive_send, en lisant chaque réponse avant de choisir la suivante. "
+            "À utiliser quand les saisies dépendent de ce que le programme répond (ex : jeu avec indices "
+            "et nombre d'essais limité) ; sinon, bash avec stdin suffit."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string", "description": "La commande qui lance le programme"}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "name": "interactive_send",
+        "description": (
+            "Envoie UNE ligne (comme si on la tapait puis appuyait sur Entrée) au programme d'une session "
+            "ouverte par interactive_start, et renvoie ce qu'il affiche en réponse. Indique aussi si le "
+            "programme s'est terminé."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Le numéro donné par interactive_start"},
+                "text": {"type": "string", "description": "La ligne à taper (sans le retour à la ligne)"},
+            },
+            "required": ["session_id", "text"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "name": "bash",
         "description": (
             "Exécute une commande shell dans le dossier du projet et renvoie sa sortie et son code de "
             f"sortie (0 = succès). Limite : {BASH_TIMEOUT} s. Utile pour lancer les tests (ex: uv run pytest) "
-            "et vérifier ton travail après une modification. Il n'y a pas de clavier : pour tester un "
-            "programme qui pose des questions (input()), donne les réponses dans stdin."
+            "et vérifier ton travail après une modification. Il n'y a pas de clavier. Programme qui pose "
+            "des questions (input()) : si tu connais toutes les réponses d'avance, donne-les dans stdin ; "
+            "si tes réponses dépendent de ce que le programme affiche (jeu à indices, essais limités...), "
+            "N'UTILISE PAS bash : utilise interactive_start puis interactive_send."
         ),
         "input_schema": {
             "type": "object",
@@ -275,6 +421,8 @@ TOOL_FUNCTIONS = {
     "grep": grep,
     "edit_file": edit_file,
     "bash": bash,
+    "interactive_start": interactive_start,
+    "interactive_send": interactive_send,
 }
 
 

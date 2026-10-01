@@ -31,7 +31,8 @@ from rich.text import Text
 import tools
 
 ACCENT = "#D97757"  # l'orange de Claude
-TOOL_LABELS = {"read_file": "Read", "list_dir": "List", "grep": "Search", "edit_file": "Update", "bash": "Bash"}
+TOOL_LABELS = {"read_file": "Read", "list_dir": "List", "grep": "Search", "edit_file": "Update", "bash": "Bash",
+               "interactive_start": "Run", "interactive_send": "Type"}
 SLASH_COMMANDS = {
     "/help": "afficher cette aide",
     "/clear": "nouvelle conversation (vide l'historique envoyé au modèle)",
@@ -117,11 +118,13 @@ class StreamView:
                          transient=True, vertical_overflow="crop")
 
     def __enter__(self):
-        self.live.start()
+        if self.ui.interactive:  # pas d'animation dans un fichier ou un tube (|) : juste le résultat
+            self.live.start()
         return self
 
     def __exit__(self, *exc):
-        self.live.stop()
+        if self.ui.interactive:
+            self.live.stop()
         if self.text.strip():
             self.ui.console.print(_bullet(Markdown(self.text.strip())))
         return False
@@ -242,8 +245,10 @@ class TerminalUI:
 
     @staticmethod
     def _argument(name, tool_input):
-        if name == "bash":
+        if name in ("bash", "interactive_start"):
             arg = tool_input.get("command", "").splitlines()[0] if tool_input.get("command") else ""
+        elif name == "interactive_send":
+            arg = f"{tool_input.get('text', '')} → session {tool_input.get('session_id', '?')}"
         elif name == "grep":
             arg = f"\"{tool_input.get('pattern', '')}\" dans {tool_input.get('path', '.')}"
         else:
@@ -254,12 +259,36 @@ class TerminalUI:
         self.console.print(_bullet(Text.assemble((self._label(name, tool_input), "bold"),
                                                  f"({self._argument(name, tool_input)})"), style="green"))
 
+    @staticmethod
+    def _output_summary(lines, max_lines=5):
+        """Les premières lignes d'une sortie, PLUS toutes les notes du harness.
+
+        Les notes [indice minicode …], [code de sortie …], [session …] sont ce que le
+        harness dit au modèle : on les montre toujours, même quand la sortie est coupée.
+        """
+        notes = [line for line in lines if line.startswith("[")]
+        output = [line for line in lines if not line.startswith("[") and line.strip()]
+        summary = Text("\n".join(output[:max_lines]))
+        if len(output) > max_lines:
+            summary.append(f"\n… +{len(output) - max_lines} lignes", style="dim")
+        for note in notes:
+            if note.startswith("[indice minicode"):
+                style = "yellow"
+            elif "code de sortie" in note and not note.endswith(": 0]"):
+                style = "red"
+            else:
+                style = "dim"
+            summary.append(("\n" if summary.plain else "") + note, style=style)
+        return summary
+
     def tool_result(self, name, tool_input, result, is_error, diff_rows=None):
-        if is_error:
-            first = result.splitlines()[0] if result else "erreur"
-            self.console.print(_result_line(Text(first, style="red")))
-            return
         lines = result.splitlines()
+        if is_error:
+            summary = Text(lines[0] if lines else "erreur", style="red")
+            for note in (line for line in lines[1:] if line.startswith("[indice minicode")):
+                summary.append("\n" + note, style="yellow")
+            self.console.print(_result_line(summary))
+            return
         if name == "read_file":
             summary = Text(f"{len(lines)} lignes lues")
         elif name == "list_dir":
@@ -270,14 +299,8 @@ class TerminalUI:
             added = sum(1 for _, s, _ in diff_rows or [] if s == "+")
             removed = sum(1 for _, s, _ in diff_rows or [] if s == "-")
             summary = Group(Text(f"{tool_input['path']} : +{added} −{removed} lignes"), render_diff(diff_rows or []))
-        elif name == "bash":
-            code = lines[-1] if lines and lines[-1].startswith("[code de sortie") else ""
-            output = [line for line in lines if line != code]
-            summary = Text("\n".join(output[:5]), style="dim" if "[code de sortie : 0]" in code else "")
-            if len(output) > 5:
-                summary.append(f"\n… +{len(output) - 5} lignes", style="dim")
-            if code and code != "[code de sortie : 0]":
-                summary.append(f"\n{code}", style="red")
+        elif name in ("bash", "interactive_start", "interactive_send"):
+            summary = self._output_summary(lines)
         else:
             summary = Text(lines[0] if lines else "")
         self.console.print(_result_line(summary))
@@ -286,8 +309,8 @@ class TerminalUI:
 
     def permission(self, name, tool_input, rule=None):
         """La boîte « Voulez-vous continuer ? ». Renvoie ("yes" | "always" | "no", consigne)."""
-        if name == "bash":
-            title = "Commande bash"
+        if name in ("bash", "interactive_start"):
+            title = "Commande bash" if name == "bash" else "Programme interactif"
             body = Text(f"  {tool_input['command']}", style="bold")
             if tool_input.get("stdin") is not None:
                 typed = tool_input["stdin"].splitlines()

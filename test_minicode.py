@@ -422,3 +422,66 @@ def test_deny_beats_yolo(tmp_path, monkeypatch):
     ui = TerminalUI()
     assert minicode.ask_permission("bash", {"command": "git reset --hard HEAD~3"}, ui) == (False, None)
     assert minicode.ask_permission("bash", {"command": "git status"}, ui) == (True, None)
+
+
+# --- Sessions interactives -----------------------------------------------------------
+
+GUESS_GAME = """\
+secret = 42
+print("Devine le nombre !")
+while True:
+    guess = int(input("Ton essai : "))
+    if guess < secret:
+        print("Plus grand !")
+    elif guess > secret:
+        print("Plus petit !")
+    else:
+        print("Bravo !")
+        break
+"""
+
+
+def test_interactive_session_plays_step_by_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "g.py").write_text(GUESS_GAME)
+    try:
+        out, is_error = tools.run_tool("interactive_start", {"command": "python3 g.py"})
+        assert not is_error and "Devine le nombre !" in out and "Ton essai :" in out
+        session = re.search(r"\[session (\d+)\]", out).group(1)
+        assert "toujours ouverte" in out
+
+        out, _ = tools.run_tool("interactive_send", {"session_id": session, "text": "50"})
+        assert "Plus petit !" in out and "toujours ouverte" in out  # le modèle lit la réponse AVANT le coup suivant
+        out, _ = tools.run_tool("interactive_send", {"session_id": session, "text": "42"})
+        assert "Bravo !" in out and "[programme terminé, code de sortie : 0]" in out
+
+        out, is_error = tools.run_tool("interactive_send", {"session_id": session, "text": "1"})
+        assert is_error and "terminée" in out  # session fermée automatiquement à la fin du programme
+    finally:
+        tools.stop_all_sessions()
+
+
+def test_open_sessions_are_killed_at_end_of_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "g.py").write_text(GUESS_GAME)
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("t1", "interactive_start", command="python3 g.py")]),
+        NS(stop_reason="end_turn", content=[text("je m'arrête là")]),
+    )
+    minicode.run_turn(client, [], "teste", confirm=lambda n, i: True, ui=TerminalUI())
+    assert tools._sessions == {}  # le programme qui attendait une saisie a été arrêté
+
+
+def test_interactive_start_follows_command_rules():
+    rules = {"allow": ["interactive_start(python3 jeu.py)"], "deny": []}
+    assert permissions.decide("interactive_start", {"command": "python3 jeu.py"}, rules)[0] == "allow"
+    assert permissions.decide("interactive_start", {"command": "python3 jeu.py; rm -rf ~"}, rules)[0] == "ask"
+    assert "interactive_start" in tools.DANGEROUS_TOOLS and "interactive_send" not in tools.DANGEROUS_TOOLS
+
+
+def test_harness_hints_stay_visible_when_output_is_cut(capsys):
+    result = "\n".join(f"ligne {i}" for i in range(20)) + "\nEOFError\n[indice minicode : utilise stdin]\n[code de sortie : 1]"
+    TerminalUI().tool_result("bash", {"command": "python3 jeu.py"}, result, False)
+    out = plain(capsys.readouterr().out)
+    assert "… +16 lignes" in out
+    assert "[indice minicode : utilise stdin]" in out and "[code de sortie : 1]" in out
