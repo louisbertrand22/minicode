@@ -7,7 +7,8 @@
                       on renvoie un bloc tool_result.
   3. Boucle agent  -> on rappelle le modèle tant qu'il demande des outils.
   4. Outils qui AGISSENT : grep, edit_file, bash (l'agent peut modifier et vérifier).
-  5. Permissions (début) -> le harness demande "o/N" avant edit_file et bash.
+  5. Permissions   -> le harness demande avant edit_file et bash, sauf si une
+                      règle de .minicode/permissions.json décide (voir permissions.py).
 
 Lancer :  uv run minicode.py      (dans le dossier du projet à explorer)
 
@@ -23,6 +24,7 @@ import sys
 
 import anthropic
 
+import permissions
 from tools import DANGEROUS_TOOLS, TOOL_SCHEMAS, WORKSPACE, run_tool
 
 PROVIDER = os.environ.get("MINICODE_PROVIDER", "ollama")  # ollama | anthropic
@@ -110,16 +112,33 @@ def _preview(name, tool_input, max_lines=15):
 
 
 def ask_permission(name, tool_input):
-    """ÉTAPE 5 (début) : c'est le harness, pas le modèle, qui décide si une action a lieu."""
+    """ÉTAPE 5 : c'est le harness, pas le modèle, qui décide si une action a lieu."""
     print(_preview(name, tool_input))
+    decision, reason = permissions.decide(name, tool_input)
+    if decision == "deny":  # une interdiction l'emporte sur tout, même sur YOLO
+        print(f"{RED}  ✗ interdit par la règle {reason}{RESET}")
+        return False
+    if decision == "allow":
+        print(f"{DIM}  ✓ autorisé par la règle {reason}{RESET}")
+        return True
     if YOLO:
         print(f"{DIM}  (MINICODE_YOLO=1 : accepté automatiquement){RESET}")
         return True
+    if reason:  # ex : commande composée
+        print(f"{DIM}  ({reason}){RESET}")
+
+    remember = permissions.can_remember(name, tool_input)
+    choices = "[o]ui / [t]oujours / [N]on" if remember else "[o]ui / [N]on"
     try:
-        answer = input(f"{YELLOW}  Autoriser {name} ? [o/N] {RESET}")
+        answer = input(f"{YELLOW}  Autoriser {name} ? {choices} {RESET}").strip().lower()
     except EOFError:
         return False
-    return answer.strip().lower() in ("o", "oui", "y", "yes")
+    if remember and answer in ("t", "toujours", "a", "always"):
+        rule = permissions.suggest_rule(name, tool_input)
+        permissions.add_allow_rule(rule)
+        print(f"{DIM}  règle ajoutée dans {permissions.rules_file()} : {rule}{RESET}")
+        return True
+    return answer in ("o", "oui", "y", "yes")
 
 
 def run_turn(client, messages, user_input, confirm=ask_permission):

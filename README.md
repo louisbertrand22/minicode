@@ -75,7 +75,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 2. Outils `read_file` / `list_dir` (schéma + exécution + erreurs `is_error`)
 - [x] 3. Boucle d'agent (plusieurs appels d'outils, en parallèle, limite `MAX_STEPS`)
 - [x] 4. Outils qui agissent : `grep`, `edit_file` (remplacement exact), `bash` (+ relance si réponse vide)
-- [~] 5. Permissions : o/N avant `bash` et `edit_file` ✅ — reste : liste d'autorisations (« toujours autoriser `pytest` »)
+- [x] 5. Permissions : o/t/N avant `bash` et `edit_file`, règles allow/deny dans `.minicode/permissions.json`
 - [ ] 6. Contexte projet : charger un `AGENTS.md` dans le prompt système
 - [ ] 7. Streaming + journal JSONL de chaque requête/réponse (le plus instructif !)
 - [ ] 8. Gestion du contexte : compter les tokens, résumer les vieux tours
@@ -92,6 +92,32 @@ Tests (sans appel API) : `uv run pytest`
   rejette l'historique) avec la consigne de ne pas réessayer.
 - `MINICODE_YOLO=1` accepte tout sans demander. Pratique pour les tests, dangereux ailleurs.
 
+### Les règles (`.minicode/permissions.json`)
+
+Réponds `t` (toujours) à une question et minicode enregistre une règle pour ne plus la poser.
+Tu peux aussi écrire le fichier toi-même :
+
+```json
+{
+  "allow": ["bash(uv run pytest*)", "bash(git status)", "edit_file(src/*)"],
+  "deny":  ["bash(rm -rf*)", "bash(git push*)"]
+}
+```
+
+`outil(motif)` : le motif (glob, `*` = n'importe quoi) est comparé à la commande pour `bash`,
+au chemin pour `edit_file`. Ordre de décision (voir `permissions.py`) :
+
+1. **deny** l'emporte sur tout, même sur `MINICODE_YOLO=1` ;
+2. une **commande composée** (`;` `&&` `|` `>` `$(`…) est **toujours demandée** :
+   sans ça, `bash(uv run pytest*)` autoriserait `uv run pytest; rm -rf ~` ;
+3. **allow** ;
+4. sinon, on demande.
+
+L'agent ne peut pas écrire dans `.minicode/` avec `edit_file`, sinon il pourrait s'autoriser
+lui-même. **Limite honnête** : via `bash` (si tu l'autorises), un programme peut toujours écrire
+n'importe où. Des règles de texte ne suffisent pas à sécuriser un agent : les vrais outils
+ajoutent un **bac à sable** (conteneur, VM) qui limite ce que les commandes peuvent toucher.
+
 **Défi testé avec qwen3:8b** : sur un `calc.py` où `add` soustrait, la demande
 « lance les tests ; si un test échoue, corrige le bug et relance » donne
 `bash → grep → read_file → edit_file → bash` et des tests verts, sans aide.
@@ -99,6 +125,9 @@ Tests (sans appel API) : `uv run pytest`
 **Exercices :**
 - Crée un petit projet avec un bug et refais le défi. Refuse l'`edit_file` : que dit le modèle ?
 - Demande « supprime tous les fichiers .txt ». Lis bien la commande avant de répondre `o` !
+- Ajoute `"deny": ["edit_file(*)"]` puis demande une correction : comment réagit le modèle ?
+- Trouve une commande qui passe la règle `bash(python3*)` et fait autre chose que lancer
+  un script (indice : `python3 -c`). Que faudrait-il changer pour la bloquer ?
 - Mets `MAX_NUDGES = 0` et répète une demande de correction plusieurs fois : combien de
   réponses vides obtiens-tu ?
 

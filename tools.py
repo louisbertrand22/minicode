@@ -21,7 +21,10 @@ WORKSPACE = Path.cwd().resolve()
 MAX_OUTPUT_CHARS = 20_000  # on ne met pas un fichier de 5 Mo dans le contexte
 MAX_GREP_MATCHES = 100
 BASH_TIMEOUT = 60  # secondes ; une commande bloquée ne doit pas figer l'agent
-IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "target", ".claude"}
+IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "target", ".claude", ".minicode"}
+# Dossier des réglages de minicode (règles de permission). L'agent ne doit pas
+# pouvoir y écrire, sinon il pourrait s'autoriser lui-même n'importe quoi.
+PROTECTED_DIR = ".minicode"
 
 # Outils qui modifient le disque ou exécutent du code : le harness demande la
 # permission à l'utilisateur avant de les lancer (voir minicode.py).
@@ -98,6 +101,8 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     correspond pas, on le sait tout de suite au lieu d'abîmer le fichier.
     """
     p = _resolve(path)
+    if p.is_relative_to(WORKSPACE / PROTECTED_DIR):
+        raise ToolError(f"{PROTECTED_DIR}/ est protégé : seul l'utilisateur peut modifier les réglages de minicode.")
     if old_string == "":
         if p.exists():
             raise ToolError(f"{path} existe déjà : donne un old_string pour le modifier.")
