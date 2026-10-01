@@ -95,13 +95,12 @@ def grep(pattern: str, path: str) -> str:
     return "\n".join(matches) or "Aucun résultat."
 
 
-def edit_file(path: str, old_string: str, new_string: str) -> str:
-    """Remplace un texte EXACT par un autre. old_string vide = créer un nouveau fichier.
+def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, str]:
+    """Prépare un edit_file SANS rien écrire : renvoie (fichier, nouveau contenu, message).
 
-    Pourquoi pas "réécrire tout le fichier" ? Parce que le modèle devrait alors
-    recopier des centaines de lignes sans erreur (lent, cher, risqué). Avec un
-    remplacement exact, il n'écrit que ce qui change, et si old_string ne
-    correspond pas, on le sait tout de suite au lieu d'abîmer le fichier.
+    Lève ToolError si la modification ne peut pas marcher. Le harness l'appelle
+    AVANT de demander la permission : inutile de déranger l'utilisateur pour une
+    modification qui va échouer de toute façon.
     """
     p = _resolve(path)
     if p.is_relative_to(WORKSPACE / PROTECTED_DIR):
@@ -110,10 +109,9 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
         # Un fichier existant mais VIDE compte comme "à créer" : sinon aucun
         # old_string ne peut jamais y être trouvé et le modèle reste bloqué.
         if p.exists() and p.read_text().strip():
-            raise ToolError(f"{path} existe déjà et n'est pas vide : lis-le, puis donne un old_string pour le modifier.")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(new_string)
-        return f"Fichier créé : {path} ({len(new_string.splitlines())} lignes)"
+            raise ToolError(f"{path} existe déjà et n'est pas vide : lis-le, puis donne un old_string pour le modifier "
+                            "(pour ajouter au début, old_string = la 1re ligne actuelle, new_string = ajout + cette ligne).")
+        return p, new_string, f"Fichier créé : {path} ({len(new_string.splitlines())} lignes)"
     if not p.is_file():
         raise ToolError(f"Fichier introuvable : {path}")
     text = p.read_text()
@@ -125,8 +123,21 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
         )
     if count > 1:
         raise ToolError(f"old_string apparaît {count} fois : ajoute des lignes autour pour qu'il soit unique.")
-    p.write_text(text.replace(old_string, new_string, 1))
-    return f"Modifié : {path}"
+    return p, text.replace(old_string, new_string, 1), f"Modifié : {path}"
+
+
+def edit_file(path: str, old_string: str, new_string: str) -> str:
+    """Remplace un texte EXACT par un autre. old_string vide = créer un nouveau fichier.
+
+    Pourquoi pas "réécrire tout le fichier" ? Parce que le modèle devrait alors
+    recopier des centaines de lignes sans erreur (lent, cher, risqué). Avec un
+    remplacement exact, il n'écrit que ce qui change, et si old_string ne
+    correspond pas, on le sait tout de suite au lieu d'abîmer le fichier.
+    """
+    p, content, message = plan_edit(path, old_string, new_string)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return message
 
 
 def bash(command: str, stdin: str | None = None) -> str:
@@ -285,6 +296,19 @@ def validate_input(name: str, tool_input) -> None:
     for key, value in tool_input.items():  # les arguments optionnels aussi doivent être du texte
         if not isinstance(value, str):
             raise ToolError(f"Argument invalide pour {name} : {key} (texte attendu)")
+
+
+def precheck(name: str, tool_input) -> str | None:
+    """Vérifie un appel AVANT de demander la permission. Renvoie l'erreur, ou None si l'appel peut marcher."""
+    if name not in TOOL_FUNCTIONS:
+        return f"Outil inconnu : {name}"
+    try:
+        validate_input(name, tool_input)
+        if name == "edit_file":
+            plan_edit(**tool_input)
+    except ToolError as e:
+        return str(e)
+    return None
 
 
 def run_tool(name: str, tool_input: dict) -> tuple[str, bool]:

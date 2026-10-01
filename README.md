@@ -131,6 +131,45 @@ ajoutent un **bac à sable** (conteneur, VM) qui limite ce que les commandes peu
 - Mets `MAX_NUDGES = 0` et répète une demande de correction plusieurs fois : combien de
   réponses vides obtiens-tu ?
 
+## L'interface (façon Claude Code)
+
+Tout l'affichage est dans `ui.py` (bibliothèques `rich` et `prompt_toolkit`) ; `minicode.py`
+ne contient que le harness et appelle `ui.tool_call(...)`, `ui.permission(...)`… On pourrait
+remplacer `ui.py` par une page web sans toucher à la boucle d'agent.
+
+```
+⏺ Search("Félicitations!" dans .)
+  ⎿  1 résultats
+⏺ Update(jeu.py)
+╭─ Modifier jeu.py ─────────────────────────────────────────╮
+│   18       else:                                          │
+│   19 -         print("Félicitations!")                    │
+│   19 +         print("Bravo, tu as trouvé !")             │
+╰───────────────────────────────────────────────────────────╯
+ Voulez-vous continuer ?
+   >  1. Oui
+      2. Oui, et ne plus demander pour edit_file(jeu.py)
+      3. Non, et dire à minicode quoi faire autrement
+⏺ Le message a été remplacé…
+✻ Terminé en 41 s · 7 appel(s) au modèle · contexte 3761 tokens (3689 en cache)
+```
+
+- Saisie encadrée avec historique (↑/↓, gardé dans `.minicode/history`) et complétion des
+  commandes : `/help`, `/clear` (nouvelle conversation : on vide simplement `messages`),
+  `/trace`, `/exit`. La barre du bas affiche le modèle et la taille du contexte.
+- Pendant un appel : `✻ Réflexion… (12 s · ↓ ~300 tokens)` avec un aperçu de la réflexion du
+  modèle (`MINICODE_THINKING=0` pour le cacher), puis la réponse en Markdown.
+- Permission : flèches + Entrée. « 3. Non » demande quoi faire à la place, et cette consigne
+  est renvoyée au modèle dans le `tool_result`.
+- **Ctrl-C** interrompt le modèle : la demande en cours est annulée (l'historique est remis
+  dans son état d'avant, sinon un `tool_use` sans réponse ferait échouer l'appel suivant).
+
+Deux protections ajoutées en testant l'interface avec qwen3:8b :
+- **vérifier avant de demander** (`tools.precheck`) : un `edit_file` qui échouera de toute
+  façon (texte introuvable, fichier existant…) renvoie l'erreur au modèle sans te déranger ;
+- **détecter les boucles** : qwen3 a refait 6 fois exactement le même appel raté. Le harness
+  signale maintenant « tu as déjà fait exactement cet appel et il a échoué ».
+
 ## Étape 7 : voir ce qui se passe sous le capot
 
 **Streaming.** La réponse arrive en petits morceaux (événements `thinking`, `text`) affichés

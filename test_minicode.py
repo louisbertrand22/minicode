@@ -4,12 +4,20 @@ C'est aussi une bonne façon de voir la "forme" exacte des échanges.
 """
 
 import json
+import re
 from types import SimpleNamespace as NS
 
 import minicode
 import permissions
 import tools
 from tracelog import Trace
+from ui import TerminalUI, edit_diff
+
+
+def plain(captured):
+    """Sortie terminal sans les codes couleur ANSI, et sans les espaces de fin de ligne."""
+    no_ansi = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", captured)
+    return "\n".join(line.rstrip() for line in no_ansi.splitlines())
 
 
 def text(t):
@@ -123,15 +131,68 @@ def test_eager_input_streaming_only_for_anthropic(monkeypatch):
 
 # --- Étape 7 : streaming et journal ---------------------------------------------
 
-def test_stream_prints_text_live_and_thinking_dimmed(capsys, monkeypatch):
-    monkeypatch.setattr(minicode, "SHOW_THINKING", True)
+def test_stream_shows_answer_and_counts_context(capsys):
+    ui = TerminalUI()
     client = FakeClient(NS(stop_reason="end_turn", content=[NS(type="thinking", thinking="hmm"), text("Bonjour")],
                            usage=NS(input_tokens=120, cache_read_input_tokens=900, output_tokens=7)))
-    minicode.run_turn(client, [], "salut")
-    out = capsys.readouterr().out
-    assert "💭" in out and "hmm" in out and "Bonjour" in out
+    minicode.run_turn(client, [], "salut", ui=ui)
+    out = plain(capsys.readouterr().out)
+    assert "⏺ Bonjour" in out
+    assert "hmm" not in out  # la réflexion n'est qu'un aperçu temporaire pendant le streaming
     # vu en vrai avec Ollama : input_tokens ne compte que la partie NON mise en cache
-    assert "1020 tokens envoyés (dont 900 déjà en cache), 7 reçus" in out
+    assert (ui.context_tokens, ui.cached_tokens, ui.calls) == (1020, 900, 1)
+
+
+def test_tool_calls_are_displayed_like_claude_code(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\ny = 2\n")
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("t1", "read_file", path="a.py"),
+                                            tool_use("t2", "edit_file", path="a.py", old_string="y = 2", new_string="y = 3")]),
+        NS(stop_reason="end_turn", content=[text("fini")]),
+    )
+    minicode.run_turn(client, [], "change y", confirm=lambda n, i: True, ui=TerminalUI())
+    out = plain(capsys.readouterr().out)
+    assert "⏺ Read(a.py)" in out and "2 lignes lues" in out
+    assert "⏺ Update(a.py)" in out and "a.py : +1 −1 lignes" in out
+    assert "2 - y = 2" in out and "2 + y = 3" in out  # diff avec numéros de ligne
+
+
+def test_refusal_feedback_is_sent_to_the_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    messages = []
+    minicode.run_turn(_edit_then_done(), messages, "crée f.txt",
+                      confirm=lambda n, i: (False, "appelle-le g.txt"), ui=TerminalUI())
+    assert messages[2]["content"][0]["content"] == minicode.REFUSED + " Consigne de l'utilisateur : appelle-le g.txt"
+
+
+def test_edit_diff_line_numbers(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "f.py").write_text("a\nb\nc\nd\ne\n")
+    rows = edit_diff({"path": "f.py", "old_string": "c", "new_string": "C1\nC2"})
+    assert rows == [(1, " ", "a"), (2, " ", "b"), (3, "-", "c"), (3, "+", "C1"), (4, "+", "C2"),
+                    (5, " ", "d"), (6, " ", "e")]
+    assert edit_diff({"path": "new.py", "old_string": "", "new_string": "x\ny"}) == [(1, "+", "x"), (2, "+", "y")]
+    # vu en vrai : le modèle ne donne qu'un bout de ligne -> on affiche la ligne entière, indentation comprise
+    (tmp_path / "g.py").write_text("if x:\n    print(\"Félicitations!\")\n")
+    rows = edit_diff({"path": "g.py", "old_string": "print(\"Félicitations!\")", "new_string": "print(\"Bravo\")"})
+    assert (2, "-", "    print(\"Félicitations!\")") in rows and (2, "+", "    print(\"Bravo\")") in rows
+
+
+def test_failing_edit_does_not_ask_and_repeats_are_flagged(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "jeu.py").write_text("print('jeu')\n")
+    same_bad_call = lambda id: tool_use(id, "edit_file", path="jeu.py", old_string="", new_string="# commentaire\n")
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[same_bad_call("t1")]),
+        NS(stop_reason="tool_use", content=[same_bad_call("t2")]),
+        NS(stop_reason="end_turn", content=[text("ok")]),
+    )
+    messages = []
+    minicode.run_turn(client, messages, "ajoute un commentaire", confirm=lambda n, i: must_not_ask(n), ui=TerminalUI())
+    first, second = messages[2]["content"][0], messages[4]["content"][0]
+    assert first["is_error"] and "existe déjà" in first["content"] and "déjà fait exactement" not in first["content"]
+    assert second["is_error"] and "déjà fait exactement cet appel" in second["content"]
 
 
 def test_trace_records_every_call_with_full_history(tmp_path):
@@ -234,9 +295,12 @@ def test_bash_stdin_feeds_interactive_programs(tmp_path, monkeypatch):
     assert tools.run_tool("bash", {"command": "cat", "stdin": 5})[1] is True  # stdin doit être du texte
 
 
-def test_bash_preview_shows_typed_input():
-    preview = minicode._preview("bash", {"command": "python3 jeu.py", "stdin": "50\n25\n"})
-    assert "python3 jeu.py" in preview and "50, 25" in preview
+def test_permission_box_shows_command_and_typed_input(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "1")
+    answer = TerminalUI().permission("bash", {"command": "python3 jeu.py", "stdin": "50\n25\n"}, rule=None)
+    out = plain(capsys.readouterr().out)
+    assert answer == ("yes", None)
+    assert "Commande bash" in out and "python3 jeu.py" in out and "50, 25" in out
 
 
 def test_bash_returns_output_and_exit_code(tmp_path, monkeypatch):
@@ -343,10 +407,11 @@ def test_answer_always_saves_rule_then_stops_asking(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
     answers = iter(["t"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))  # 2e question = StopIteration
-    assert minicode.ask_permission("bash", PYTEST) is True
+    ui = TerminalUI()
+    assert minicode.ask_permission("bash", PYTEST, ui) == (True, None)
     saved = json.loads((tmp_path / ".minicode" / "permissions.json").read_text())
     assert saved == {"allow": ["bash(uv run pytest -q)"], "deny": []}
-    assert minicode.ask_permission("bash", PYTEST) is True  # la règle répond, plus de question
+    assert minicode.ask_permission("bash", PYTEST, ui) == (True, None)  # la règle répond, plus de question
 
 
 def test_deny_beats_yolo(tmp_path, monkeypatch):
@@ -354,5 +419,6 @@ def test_deny_beats_yolo(tmp_path, monkeypatch):
     monkeypatch.setattr(minicode, "YOLO", True)
     (tmp_path / ".minicode").mkdir()
     (tmp_path / ".minicode" / "permissions.json").write_text('{"deny": ["bash(git reset --hard*)"]}')
-    assert minicode.ask_permission("bash", {"command": "git reset --hard HEAD~3"}) is False
-    assert minicode.ask_permission("bash", {"command": "git status"}) is True
+    ui = TerminalUI()
+    assert minicode.ask_permission("bash", {"command": "git reset --hard HEAD~3"}, ui) == (False, None)
+    assert minicode.ask_permission("bash", {"command": "git status"}, ui) == (True, None)

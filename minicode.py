@@ -9,8 +9,11 @@
   4. Outils qui AGISSENT : grep, edit_file, bash (l'agent peut modifier et vérifier).
   5. Permissions   -> le harness demande avant edit_file et bash, sauf si une
                       règle de .minicode/permissions.json décide (voir permissions.py).
-  7. Streaming + journal -> la réponse s'affiche mot à mot, et chaque échange est
+  7. Streaming + journal -> la réponse s'affiche au fil de l'eau, et chaque échange est
                       enregistré dans .minicode/traces/ (voir tracelog.py, show_trace.py).
+
+Tout l'affichage (façon Claude Code) est dans ui.py : ce fichier-ci ne contient
+que le harness, et appelle `ui.xxx()` pour montrer ce qui se passe.
 
 Lancer :  uv run minicode.py      (dans le dossier du projet à explorer)
 
@@ -21,6 +24,7 @@ Deux "fournisseurs" de modèle, même boucle :
   - anthropic (payant) : les modèles Claude, via ANTHROPIC_API_KEY.
 """
 
+import json
 import os
 import sys
 import time
@@ -28,8 +32,9 @@ import time
 import anthropic
 
 import permissions
-from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, run_tool
+from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, precheck, run_tool
 from tracelog import Trace
+from ui import TerminalUI, edit_diff
 
 PROVIDER = os.environ.get("MINICODE_PROVIDER", "ollama")  # ollama | anthropic
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -40,7 +45,7 @@ MAX_STEPS = 30  # garde-fou : nombre max d'appels au modèle pour UNE demande
 # MINICODE_YOLO=1 : accepte tout sans demander (comme le mode sans permissions de
 # Claude Code). Pratique pour les tests automatiques, dangereux sur un vrai projet.
 YOLO = os.environ.get("MINICODE_YOLO") == "1"
-SHOW_THINKING = os.environ.get("MINICODE_THINKING", "1") != "0"  # 0 = cacher la réflexion
+SHOW_THINKING = os.environ.get("MINICODE_THINKING", "1") != "0"  # 0 = cacher l'aperçu de la réflexion
 TRACE = os.environ.get("MINICODE_TRACE", "1") != "0"             # 0 = pas de journal
 
 SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
@@ -58,10 +63,7 @@ Méthode :
   valeur aléatoire par une valeur fixe) : adapte le test, pas le programme.
 - L'utilisateur peut refuser une action : dans ce cas, ne la retente pas, demande-lui comment procéder.
 
-Réponds de façon concise, en français."""
-
-# Couleurs ANSI, pour distinguer ce que fait le harness de ce que dit le modèle.
-DIM, CYAN, RED, GREEN, YELLOW, RESET = "\033[2m", "\033[36m", "\033[31m", "\033[32m", "\033[33m", "\033[0m"
+Réponds de façon concise, en français. Tu peux utiliser du Markdown."""
 
 REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui comment il veut procéder."
 # Les petits modèles finissent parfois leur tour avec seulement de la réflexion
@@ -69,34 +71,28 @@ REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui
 NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
 MAX_NUDGES = 1
 
+_ui = None
+
+
+def get_ui():
+    """L'interface par défaut (créée à la première utilisation)."""
+    global _ui
+    if _ui is None:
+        _ui = TerminalUI(PROVIDER, MODEL, SHOW_THINKING, history_file=_history_file())
+    return _ui
+
+
+def _history_file():
+    path = WORKSPACE / PROTECTED_DIR / "history"
+    path.parent.mkdir(exist_ok=True)
+    return path
+
 
 def make_client():
     if PROVIDER == "ollama":
         # Le serveur local ne vérifie pas la clé, mais le SDK en exige une.
         return anthropic.Anthropic(base_url=OLLAMA_URL, api_key="ollama")
     return anthropic.Anthropic()  # lit ANTHROPIC_API_KEY dans l'environnement
-
-
-class LivePrinter:
-    """Affiche le flux au fil de l'eau : la réflexion en gris (💭), la réponse en normal."""
-
-    def __init__(self):
-        self.kind = None  # ce qu'on est en train d'afficher : None, "thinking" ou "text"
-
-    def show(self, kind, chunk):
-        if kind == "thinking" and not SHOW_THINKING:
-            return
-        if kind != self.kind:
-            self.end()
-            if kind == "thinking":
-                print(f"{DIM}  💭 ", end="")  # gris jusqu'au RESET de end()
-            self.kind = kind
-        print(chunk, end="", flush=True)
-
-    def end(self):
-        if self.kind:
-            print(RESET)  # fin de la couleur + retour à la ligne
-            self.kind = None
 
 
 def request_params(messages):
@@ -121,123 +117,78 @@ def request_params(messages):
     }
 
 
-def call_model(client, messages, trace=None):
+def call_model(client, messages, trace=None, ui=None):
     """UN appel au modèle, en STREAMING (étape 7).
 
     Au lieu d'attendre la réponse complète, on reçoit des petits événements
-    ("thinking", "text"...) qu'on affiche dès qu'ils arrivent. À la fin, le SDK
-    reconstitue le message complet (get_final_message), identique à ce que
-    renverrait un appel normal : le reste de la boucle ne change pas.
+    ("thinking", "text"...) qu'on passe à l'interface dès qu'ils arrivent. À la
+    fin, le SDK reconstitue le message complet (get_final_message), identique à
+    ce que renverrait un appel normal : le reste de la boucle ne change pas.
     """
+    ui = ui or get_ui()
     api = client.messages if PROVIDER == "ollama" else client.beta.messages
-    printer = LivePrinter()
     start = time.time()
-    try:
-        with api.stream(**request_params(messages)) as stream:
-            for event in stream:
-                if event.type == "thinking":
-                    printer.show("thinking", event.thinking)
-                elif event.type == "text":
-                    printer.show("text", event.text)
-            response = stream.get_final_message()
-    finally:
-        printer.end()
+    with ui.model_call() as view, api.stream(**request_params(messages)) as stream:
+        for event in stream:
+            if event.type == "thinking":
+                view.on_thinking(event.thinking)
+            elif event.type == "text":
+                view.on_text(event.text)
+        response = stream.get_final_message()
     seconds = time.time() - start
-
-    usage = getattr(response, "usage", None)
-    if usage:
-        # Le total grossit à chaque appel : c'est tout l'historique qu'on renvoie.
-        # Mais le serveur garde en CACHE le début déjà vu (prompt caching) : seule la
-        # partie nouvelle est vraiment recalculée, d'où input_tokens qui reste petit.
-        cached = (getattr(usage, "cache_read_input_tokens", 0) or 0)
-        total = usage.input_tokens + cached + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
-        print(f"{DIM}  · {total} tokens envoyés (dont {cached} déjà en cache), "
-              f"{usage.output_tokens} reçus, {seconds:.1f} s{RESET}")
+    # Le total grossit à chaque appel (tout l'historique), mais le serveur garde en
+    # CACHE le début déjà vu : `input_tokens` ne compte que la partie nouvelle.
+    ui.record_usage(getattr(response, "usage", None))
     if trace:
         trace.log_call(messages, response, seconds)
     return response
 
 
-def _short(tool_input, limit=60):
-    """Version courte des arguments, pour la ligne grise `→ outil(...)`."""
-    parts = []
-    for key, value in tool_input.items():
-        value = repr(value)
-        parts.append(f"{key}={value[:limit] + '…' if len(value) > limit else value}")
-    return ", ".join(parts)
+def ask_permission(name, tool_input, ui=None):
+    """ÉTAPE 5 : c'est le harness, pas le modèle, qui décide si une action a lieu.
 
-
-def _preview(name, tool_input, max_lines=15):
-    """Montre à l'utilisateur ce que l'outil VA faire, avant qu'il le fasse."""
-    if name == "bash":
-        preview = f"{YELLOW}  $ {tool_input['command']}{RESET}"
-        if tool_input.get("stdin") is not None:
-            typed = tool_input["stdin"].splitlines()
-            shown = ", ".join(typed[:10]) + (f", … ({len(typed)} saisies)" if len(typed) > 10 else "")
-            preview += f"\n{YELLOW}  ⌨ saisies envoyées : {shown}{RESET}"
-        return preview
-    if name == "edit_file":
-        lines = [f"{YELLOW}  fichier : {tool_input['path']}{RESET}"]
-        for prefix, color, key in (("-", RED, "old_string"), ("+", GREEN, "new_string")):
-            text_lines = tool_input[key].splitlines()
-            lines += [f"{color}  {prefix} {line}{RESET}" for line in text_lines[:max_lines]]
-            if len(text_lines) > max_lines:
-                lines.append(f"{DIM}  ... ({len(text_lines) - max_lines} lignes de plus){RESET}")
-        return "\n".join(lines)
-    return f"  {tool_input}"
-
-
-def ask_permission(name, tool_input):
-    """ÉTAPE 5 : c'est le harness, pas le modèle, qui décide si une action a lieu."""
-    print(_preview(name, tool_input))
+    Renvoie (autorisé, consigne de l'utilisateur ou None).
+    """
+    ui = ui or get_ui()
     decision, reason = permissions.decide(name, tool_input)
     if decision == "deny":  # une interdiction l'emporte sur tout, même sur YOLO
-        print(f"{RED}  ✗ interdit par la règle {reason}{RESET}")
-        return False
+        ui.error(f"✗ interdit par la règle {reason}")
+        return False, None
     if decision == "allow":
-        print(f"{DIM}  ✓ autorisé par la règle {reason}{RESET}")
-        return True
+        ui.info(f"✓ autorisé par la règle {reason}")
+        return True, None
     if YOLO:
-        print(f"{DIM}  (MINICODE_YOLO=1 : accepté automatiquement){RESET}")
-        return True
+        ui.info("(MINICODE_YOLO=1 : accepté automatiquement)")
+        return True, None
     if reason:  # ex : commande composée
-        print(f"{DIM}  ({reason}){RESET}")
+        ui.info(f"({reason})")
 
-    remember = permissions.can_remember(name, tool_input)
-    choices = "[o]ui / [t]oujours / [N]on" if remember else "[o]ui / [N]on"
-    try:
-        answer = input(f"{YELLOW}  Autoriser {name} ? {choices} {RESET}").strip().lower()
-    except EOFError:
-        return False
-    if remember and answer in ("t", "toujours", "a", "always"):
-        rule = permissions.suggest_rule(name, tool_input)
+    rule = permissions.suggest_rule(name, tool_input) if permissions.can_remember(name, tool_input) else None
+    answer, feedback = ui.permission(name, tool_input, rule)
+    if answer == "always":
         permissions.add_allow_rule(rule)
-        print(f"{DIM}  règle ajoutée dans {permissions.rules_file()} : {rule}{RESET}")
-        return True
-    return answer in ("o", "oui", "y", "yes")
+        ui.info(f"règle ajoutée dans {permissions.rules_file()} : {rule}")
+    return answer in ("yes", "always"), feedback
 
 
-def _harness_message(text):
-    """Un message du harness (pas du modèle) : affiché en couleur ET renvoyé."""
-    print(text)
-    return text
-
-
-def run_turn(client, messages, user_input, confirm=ask_permission, trace=None):
+def run_turn(client, messages, user_input, confirm=None, trace=None, ui=None):
     """Traite une demande utilisateur : la BOUCLE D'AGENT (étape 3).
 
-    Modifie `messages` sur place. Renvoie le texte final du modèle (déjà affiché
-    pendant le streaming). `confirm(name, input) -> bool` est appelé avant chaque
-    outil dangereux.
+    Modifie `messages` sur place. Renvoie le texte final du modèle (déjà affiché).
+    `confirm(name, input)` est appelé avant chaque outil dangereux ; il renvoie
+    un booléen, ou (booléen, consigne de l'utilisateur).
     """
+    ui = ui or get_ui()
+    confirm = confirm or (lambda name, tool_input: ask_permission(name, tool_input, ui))
     turn_start = len(messages)
     messages.append({"role": "user", "content": user_input})
     nudges = 0
     json_retries = 0
+    failed_calls = set()  # appels qui ont échoué pendant cette demande
 
     for step in range(MAX_STEPS):
         try:
-            response = call_model(client, messages, trace)
+            response = call_model(client, messages, trace, ui)
         except ValueError:
             # En streaming, les arguments d'un outil arrivent par morceaux de JSON.
             # S'ils sont illisibles, il n'y a pas de tool_use complet à qui répondre :
@@ -245,7 +196,7 @@ def run_turn(client, messages, user_input, confirm=ask_permission, trace=None):
             json_retries += 1
             if json_retries > 2:
                 raise
-            print(f"{DIM}  (arguments d'outil illisibles, minicode relance l'appel){RESET}")
+            ui.info("(arguments d'outil illisibles, minicode relance l'appel)")
             continue
         json_retries = 0
 
@@ -256,7 +207,9 @@ def run_turn(client, messages, user_input, confirm=ask_permission, trace=None):
             # Réponse inutilisable (et peut-être un tool_use tronqué) : on annule
             # toute la demande pour garder un historique valide.
             del messages[turn_start:]
-            return _harness_message(f"{RED}[arrêt : {response.stop_reason}] Demande annulée, reformule-la.{RESET}")
+            message = f"[arrêt : {response.stop_reason}] Demande annulée, reformule-la."
+            ui.error(message)
+            return message
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -267,13 +220,33 @@ def run_turn(client, messages, user_input, confirm=ask_permission, trace=None):
                 text_parts.append(block.text)
             elif block.type == "tool_use":
                 # Le modèle DEMANDE un outil ; c'est nous qui l'exécutons.
-                print(f"{DIM}  → {block.name}({_short(block.input)}){RESET}")
-                if block.name in DANGEROUS_TOOLS and not confirm(block.name, block.input):
-                    # Refus : on ne l'exécute pas, mais on DOIT quand même renvoyer
-                    # un tool_result, sinon l'API rejette l'historique.
-                    result, is_error = REFUSED, True
+                ui.tool_call(block.name, block.input)
+                diff = _diff_before_edit(block.name, block.input)
+                allowed, feedback = True, None
+                problem = precheck(block.name, block.input)
+                if problem:
+                    # L'appel va échouer : inutile de demander la permission.
+                    result, is_error = problem, True
                 else:
-                    result, is_error = run_tool(block.name, block.input)
+                    if block.name in DANGEROUS_TOOLS:
+                        answer = confirm(block.name, block.input)
+                        allowed, feedback = answer if isinstance(answer, tuple) else (answer, None)
+                    if allowed:
+                        result, is_error = run_tool(block.name, block.input)
+                    else:
+                        # Refus : on ne l'exécute pas, mais on DOIT quand même renvoyer
+                        # un tool_result, sinon l'API rejette l'historique.
+                        result = REFUSED + (f" Consigne de l'utilisateur : {feedback}" if feedback else "")
+                        is_error = True
+                if is_error and allowed:
+                    # Les petits modèles refont parfois EXACTEMENT le même appel raté, en boucle.
+                    key = json.dumps([block.name, block.input], sort_keys=True)
+                    if key in failed_calls:
+                        result += ("\n[indice minicode : tu as déjà fait exactement cet appel et il a échoué "
+                                   "de la même façon. Change d'approche.]")
+                    failed_calls.add(key)
+                ui.tool_result(block.name, block.input, result if allowed else "refusé par l'utilisateur",
+                               is_error, diff)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,  # relie le résultat à la demande
@@ -285,16 +258,30 @@ def run_turn(client, messages, user_input, confirm=ask_permission, trace=None):
             if not text_parts and nudges < MAX_NUDGES:
                 # Réponse vide : on relance au lieu de laisser l'utilisateur sans rien.
                 nudges += 1
-                print(f"{DIM}  (réponse vide, minicode relance le modèle){RESET}")
+                ui.info("(réponse vide, minicode relance le modèle)")
                 messages.append({"role": "user", "content": NUDGE})
                 continue
             # Le modèle n'a plus besoin d'outils : la demande est terminée.
-            return "\n".join(text_parts) or _harness_message(f"{DIM}(le modèle n'a rien répondu){RESET}")
+            if not text_parts:
+                ui.info("(le modèle n'a rien répondu)")
+            return "\n".join(text_parts) or "(le modèle n'a rien répondu)"
 
         # TOUS les résultats partent dans UN SEUL message "user".
         messages.append({"role": "user", "content": tool_results})
 
-    return _harness_message(f"{RED}[arrêt : {MAX_STEPS} étapes atteintes sans réponse finale]{RESET}")
+    message = f"[arrêt : {MAX_STEPS} étapes atteintes sans réponse finale]"
+    ui.error(message)
+    return message
+
+
+def _diff_before_edit(name, tool_input):
+    """Pour afficher le diff APRÈS l'édition, il faut le calculer AVANT (le fichier va changer)."""
+    if name != "edit_file":
+        return None
+    try:
+        return edit_diff(tool_input)
+    except (KeyError, OSError):
+        return None
 
 
 def main():
@@ -304,37 +291,49 @@ def main():
     if TRACE:
         trace = Trace(WORKSPACE / PROTECTED_DIR / "traces",
                       provider=PROVIDER, model=MODEL, system=SYSTEM_PROMPT, tools=TOOL_SCHEMAS)
+    ui = get_ui()
+    ui.welcome(WORKSPACE, trace.path if trace else None)
 
-    print(f"minicode — {PROVIDER} / {MODEL}, projet {WORKSPACE}")
-    if trace:
-        print(f"{DIM}journal : {trace.path}{RESET}")
-    print("Tape ta demande (Ctrl-D ou 'exit' pour quitter).\n")
     while True:
-        try:
-            user_input = input(f"{CYAN}> {RESET}").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        user_input = ui.read_input()
+        if user_input is None or user_input.strip() in ("/exit", "exit", "quit"):
             break
-        if user_input in ("exit", "quit"):
-            break
+        user_input = user_input.strip()
         if not user_input:
             continue
-        start = len(messages)
+        if user_input == "/help":
+            ui.help()
+            continue
+        if user_input == "/clear":
+            # Le modèle n'a pas de mémoire : vider la liste = nouvelle conversation.
+            messages.clear()
+            ui.reset()
+            ui.info("Nouvelle conversation : l'historique envoyé au modèle est vide.")
+            continue
+        if user_input == "/trace":
+            ui.info(f"journal : {trace.path}" if trace else "journal désactivé (MINICODE_TRACE=0)")
+            continue
+
+        start, started_at = len(messages), time.time()
+        calls_before = ui.calls
         try:
-            run_turn(client, messages, user_input, trace=trace)  # la réponse s'affiche en direct
-            print()
-        except anthropic.AuthenticationError:
-            sys.exit(f"{RED}Clé API invalide ou absente : exporte ANTHROPIC_API_KEY.{RESET}")
-        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
-            # Une erreur en plein tour laisse l'historique à moitié écrit (ex : un
-            # tool_use sans son tool_result), que l'API refuserait ensuite. On annule.
+            run_turn(client, messages, user_input, trace=trace, ui=ui)
+            ui.turn_done(ui.calls - calls_before, time.time() - started_at)
+        except KeyboardInterrupt:
+            # Ctrl-C : on abandonne la demande en cours. L'historique peut être à
+            # moitié écrit (un tool_use sans son tool_result) : on l'annule.
             del messages[start:]
-            print(f"{RED}Erreur API : {e} Demande annulée.{RESET}")
+            ui.warn("Interrompu. La demande a été annulée.")
+        except anthropic.AuthenticationError:
+            sys.exit("Clé API invalide ou absente : exporte ANTHROPIC_API_KEY.")
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            # Une erreur en plein tour laisse l'historique à moitié écrit : on annule.
+            del messages[start:]
+            ui.error(f"Erreur API : {e} Demande annulée.")
             if PROVIDER == "ollama" and isinstance(e, anthropic.APIConnectionError):
-                print(f"{RED}Ollama ne répond pas sur {OLLAMA_URL} : lance `ollama serve`.{RESET}")
+                ui.error(f"Ollama ne répond pas sur {OLLAMA_URL} : lance `ollama serve`.")
             elif PROVIDER == "ollama" and isinstance(e, anthropic.NotFoundError):
-                print(f"{RED}Modèle absent : lance `ollama pull {MODEL}`.{RESET}")
-            print()
+                ui.error(f"Modèle absent : lance `ollama pull {MODEL}`.")
 
 
 if __name__ == "__main__":
