@@ -263,6 +263,30 @@ Ce qu'il a fallu pour en arriver là :
 - un bug du harness : le programme ferme son affichage quelques millisecondes avant que son
   processus disparaisse, et minicode disait « session toujours ouverte » après la victoire.
 
+### Quand le modèle casse le code en voulant le modifier
+
+Histoire vraie (journal de `test_ai/`) :
+1. « ajoute une limite de temps » → qwen3 **réécrit tout le fichier** de mémoire… et oublie la
+   ligne `current_attempts = 0`. Le jeu plante (`NameError`). Le diff montrait la ligne retirée,
+   mais noyée dans un fichier entier.
+2. « corrige cette erreur » → il retente de remplacer **tout le fichier** et se trompe en
+   recopiant : une ligne `import time` oubliée, puis **`时间_limit`** au lieu de `time_limit`
+   (qwen3 est un modèle chinois). 4 échecs, puis il abandonne en affichant l'appel en texte.
+3. Après une première correction du harness, il corrige… en cassant l'indentation
+   (`IndentationError`) et annonce « corrigé ».
+
+Trois protections dans `edit_file`, toutes vérifiées AVANT la demande de permission :
+- **pas de gros remplacement** : un `old_string` de 15 lignes ou plus est refusé (« modifie
+  seulement les lignes concernées »). C'est aussi ce qui évite la ligne oubliée du point 1 ;
+- **une erreur qui dit OÙ ça diverge** au lieu de « introuvable » :
+  `correspond au fichier jusqu'à la ligne 7, puis diffère : fichier 'time_limit = 60' / toi '时间_limit = 60'` ;
+- **vérification de la syntaxe Python** : une modification qui casserait un fichier `.py` valide
+  est refusée, avec l'erreur exacte (`IndentationError ligne 17`).
+
+Résultat sur la même demande : `current_attempts = 0` ajouté au bon endroit en 3 appels.
+Limite : une erreur **logique** (remettre le compteur à 0 *dans* la boucle) reste du code valide ;
+seuls des tests ou une exécution l'attrapent.
+
 Enfin, les notes du harness (`[indice minicode …]`, `[code de sortie …]`, `[session …]`)
 sont maintenant **toujours affichées** sous un résultat, même quand la sortie est coupée :
 tu vois ce que le harness dit au modèle.

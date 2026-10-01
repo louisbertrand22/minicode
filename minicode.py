@@ -60,6 +60,8 @@ Méthode :
   paramètre stdin de bash. Si elles en dépendent (jeu avec indices, nombre d'essais limité...),
   utilise interactive_start puis interactive_send, une réponse à la fois, en lisant chaque réponse.
   Lance les programmes Python avec python3, et utilise des chemins relatifs au projet.
+- Quand l'utilisateur demande de corriger, modifier ou créer quelque chose, FAIS-LE avec les outils
+  au lieu de demander « voulez-vous que je le fasse ? » : il valide chaque action dangereuse.
 - Fais les vérifications toi-même au lieu de demander à l'utilisateur de les faire.
 - Ne modifie JAMAIS un programme juste pour qu'un test passe (par exemple en remplaçant une
   valeur aléatoire par une valeur fixe) : adapte le test, pas le programme.

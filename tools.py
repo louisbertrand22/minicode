@@ -27,6 +27,7 @@ WORKSPACE = Path.cwd().resolve()
 
 MAX_OUTPUT_CHARS = 20_000  # on ne met pas un fichier de 5 Mo dans le contexte
 MAX_GREP_MATCHES = 100
+MAX_EDIT_LINES = 15  # un old_string plus long = le modèle essaie de recopier tout le fichier
 BASH_TIMEOUT = 60  # secondes ; une commande bloquée ne doit pas figer l'agent
 IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "target", ".claude", ".minicode"}
 # Dossier des réglages de minicode (règles de permission). L'agent ne doit pas
@@ -103,6 +104,30 @@ def grep(pattern: str, path: str) -> str:
     return "\n".join(matches) or "Aucun résultat."
 
 
+def _mismatch_hint(text: str, old: str) -> str:
+    """Dit au modèle OÙ son old_string cesse de correspondre au fichier.
+
+    « Introuvable » tout court ne l'aide pas à se corriger ; « ligne 7 : le fichier
+    dit X, toi tu as écrit Y » oui. On cherche le plus long début de old_string
+    présent dans le fichier (recherche dichotomique sur la longueur).
+    """
+    low, high = 0, len(old)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if old[:mid] in text:
+            low = mid
+        else:
+            high = mid - 1
+    if low == 0:
+        return "Même son début n'existe pas dans le fichier : relis-le avec read_file."
+    end = text.find(old[:low]) + low  # où le fichier et old_string se séparent
+    line_no = text[:end].count("\n") + 1
+    file_line = text.splitlines()[line_no - 1] if line_no <= len(text.splitlines()) else ""
+    your_line = (old[:low].rsplit("\n", 1)[-1] + old[low:]).split("\n", 1)[0]
+    return (f"Ton old_string correspond au fichier jusqu'à la ligne {line_no}, puis diffère :\n"
+            f"  dans le fichier : {file_line!r}\n  dans ton texte  : {your_line!r}")
+
+
 def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, str]:
     """Prépare un edit_file SANS rien écrire : renvoie (fichier, nouveau contenu, message).
 
@@ -122,16 +147,56 @@ def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, s
         return p, new_string, f"Fichier créé : {path} ({len(new_string.splitlines())} lignes)"
     if not p.is_file():
         raise ToolError(f"Fichier introuvable : {path}")
+    if old_string.count("\n") >= MAX_EDIT_LINES:
+        # Vu en vrai : qwen3 réécrivait tout le fichier de mémoire. Résultat : une ligne
+        # oubliée (bug introduit), puis des erreurs de recopie (« 时间_limit » au lieu de
+        # « time_limit ») qui empêchaient toute correction.
+        raise ToolError(
+            f"old_string fait {old_string.count(chr(10)) + 1} lignes : ne recopie pas tout le fichier. "
+            "Modifie seulement la ou les lignes concernées (avec au plus une ligne autour pour la "
+            "situer), quitte à faire plusieurs edit_file."
+        )
     text = p.read_text()
     count = text.count(old_string)
     if count == 0:
         raise ToolError(
-            "old_string introuvable dans le fichier. Relis le fichier avec read_file et "
-            "recopie le texte exactement (espaces et indentation compris, sans les numéros de ligne)."
+            "old_string introuvable dans le fichier. " + _mismatch_hint(text, old_string) +
+            "\nRecopie le texte exactement (espaces et indentation compris, sans les numéros de ligne)."
         )
     if count > 1:
         raise ToolError(f"old_string apparaît {count} fois : ajoute des lignes autour pour qu'il soit unique.")
-    return p, text.replace(old_string, new_string, 1), f"Modifié : {path}"
+    new_text = text.replace(old_string, new_string, 1)
+    _check_python_still_valid(path, text, new_text)
+    return p, new_text, f"Modifié : {path}"
+
+
+def _syntax_error(path: str, code: str) -> SyntaxError | None:
+    try:
+        compile(code, path, "exec")
+    except SyntaxError as e:
+        return e
+    return None
+
+
+def _check_python_still_valid(path: str, before: str, after: str) -> None:
+    """Refuse une modification qui CASSE un fichier Python qui était valide.
+
+    Vu en vrai : qwen3 a « corrigé » un bug en perdant l'indentation d'une ligne ;
+    le fichier ne se lançait plus (IndentationError) et il a annoncé « corrigé ».
+    Les vrais harness lancent ce genre de vérification (compilateur, linter) après
+    chaque modification et renvoient le résultat au modèle.
+    """
+    if not path.endswith(".py") or _syntax_error(path, before):
+        return  # pas du Python, ou déjà cassé avant : on ne bloque pas une tentative de réparation
+    error = _syntax_error(path, after)
+    if error:
+        line = after.splitlines()[error.lineno - 1] if error.lineno and error.lineno <= len(after.splitlines()) else ""
+        raise ToolError(
+            f"Modification refusée : elle casserait {path} ({type(error).__name__} ligne {error.lineno} : "
+            f"{error.msg}).\n  ligne {error.lineno} après ta modification : {line!r}\n"
+            "Le fichier n'a pas été modifié. Vérifie l'indentation de new_string (elle doit être la même "
+            "que celle des lignes d'origine)."
+        )
 
 
 def edit_file(path: str, old_string: str, new_string: str) -> str:
@@ -334,7 +399,10 @@ TOOL_SCHEMAS = [
         "description": (
             "Modifie un fichier en remplaçant old_string par new_string. old_string doit être recopié "
             "EXACTEMENT depuis le fichier (indentation comprise, sans les numéros de ligne de read_file) "
-            "et n'apparaître qu'une seule fois. Lis toujours le fichier avant de le modifier. "
+            "et n'apparaître qu'une seule fois. old_string doit être COURT : seulement la ou les lignes "
+            f"à changer (au plus {MAX_EDIT_LINES - 1}), jamais tout le fichier. Pour AJOUTER une ligne, "
+            "prends comme old_string la ligne voisine, et mets dans new_string cette ligne + la nouvelle. "
+            "Lis toujours le fichier avant de le modifier. "
             "Pour créer un nouveau fichier : old_string vide et tout le contenu dans new_string."
         ),
         "input_schema": {

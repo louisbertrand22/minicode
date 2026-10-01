@@ -179,6 +179,46 @@ def test_edit_diff_line_numbers(tmp_path, monkeypatch):
     assert (2, "-", "    print(\"Félicitations!\")") in rows and (2, "+", "    print(\"Bravo\")") in rows
 
 
+def test_edit_mismatch_says_where_it_diverges(tmp_path, monkeypatch):
+    # Cas réel : qwen3 recopiait le fichier de mémoire et écrivait « 时间_limit » au lieu de « time_limit ».
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "jeu.py").write_text("import random\nimport time\n\nmax_attempts = 7\ntime_limit = 60\n")
+    out, is_error = tools.run_tool("edit_file", {"path": "jeu.py", "new_string": "x",
+                                                 "old_string": "import time\n\nmax_attempts = 7\n时间_limit = 60"})
+    assert is_error and "jusqu'à la ligne 5" in out
+    assert "'time_limit = 60'" in out and "'时间_limit = 60'" in out
+    out, _ = tools.run_tool("edit_file", {"path": "jeu.py", "old_string": "import random\n\nmax", "new_string": "x"})
+    assert "ligne 2" in out and "'import time'" in out  # ligne oubliée par le modèle
+
+
+def test_edit_that_breaks_python_is_refused(tmp_path, monkeypatch):
+    # Cas réel : qwen3 a perdu l'indentation d'une ligne en « corrigeant » le jeu.
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    code = "while True:\n    print('a')\n    guess = 1\n    break\n"
+    (tmp_path / "jeu.py").write_text(code)
+    out, is_error = tools.run_tool("edit_file", {"path": "jeu.py", "old_string": "    print('a')",
+                                                 "new_string": "    n = 0\nprint('a')"})
+    assert is_error and "Modification refusée" in out and "IndentationError ligne 4" in out
+    assert (tmp_path / "jeu.py").read_text() == code  # fichier intact
+    # une modification valide passe ; un fichier déjà cassé peut toujours être réparé
+    assert tools.run_tool("edit_file", {"path": "jeu.py", "old_string": "    print('a')",
+                                        "new_string": "    n = 0\n    print('a')"})[1] is False
+    (tmp_path / "cassé.py").write_text("if x\n    pass\n")
+    assert tools.run_tool("edit_file", {"path": "cassé.py", "old_string": "if x", "new_string": "if y"})[1] is False
+
+
+def test_whole_file_rewrites_are_refused(tmp_path, monkeypatch):
+    # Cas réel : en réécrivant tout le fichier, qwen3 a OUBLIÉ une ligne (current_attempts = 0).
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    content = "".join(f"ligne {i}\n" for i in range(30))
+    (tmp_path / "f.py").write_text(content)
+    out, is_error = tools.run_tool("edit_file", {"path": "f.py", "old_string": content, "new_string": content + "x\n"})
+    assert is_error and "ne recopie pas tout le fichier" in out
+    assert (tmp_path / "f.py").read_text() == content
+    # une modification courte, elle, passe
+    assert tools.run_tool("edit_file", {"path": "f.py", "old_string": "ligne 7\n", "new_string": "ligne 7\nnouvelle\n"})[1] is False
+
+
 def test_failing_edit_does_not_ask_and_repeats_are_flagged(tmp_path, monkeypatch):
     monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
     (tmp_path / "jeu.py").write_text("print('jeu')\n")
