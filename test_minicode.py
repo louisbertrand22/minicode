@@ -126,11 +126,12 @@ def test_eager_input_streaming_only_for_anthropic(monkeypatch):
 def test_stream_prints_text_live_and_thinking_dimmed(capsys, monkeypatch):
     monkeypatch.setattr(minicode, "SHOW_THINKING", True)
     client = FakeClient(NS(stop_reason="end_turn", content=[NS(type="thinking", thinking="hmm"), text("Bonjour")],
-                           usage=NS(input_tokens=120, output_tokens=7)))
+                           usage=NS(input_tokens=120, cache_read_input_tokens=900, output_tokens=7)))
     minicode.run_turn(client, [], "salut")
     out = capsys.readouterr().out
     assert "💭" in out and "hmm" in out and "Bonjour" in out
-    assert "120 tokens envoyés, 7 reçus" in out
+    # vu en vrai avec Ollama : input_tokens ne compte que la partie NON mise en cache
+    assert "1020 tokens envoyés (dont 900 déjà en cache), 7 reçus" in out
 
 
 def test_trace_records_every_call_with_full_history(tmp_path):
@@ -217,6 +218,25 @@ def test_whitespace_answer_counts_as_empty():
     client = FakeClient(NS(stop_reason="end_turn", content=[text(" \n")]),
                         NS(stop_reason="end_turn", content=[text("Voilà.")]))
     assert minicode.run_turn(client, [], "fais-le") == "Voilà."
+
+
+def test_bash_stdin_feeds_interactive_programs(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "ask.py").write_text("a = input('nombre ? ')\nb = input('autre ? ')\nprint('somme', int(a) + int(b))\n")
+    out, is_error = tools.run_tool("bash", {"command": "python3 ask.py", "stdin": "2\n3\n"})
+    assert not is_error and "somme 5" in out and "[code de sortie : 0]" in out
+    # sans stdin : EOFError, et minicode ajoute un indice pour le modèle
+    out, _ = tools.run_tool("bash", {"command": "python3 ask.py"})
+    assert "EOFError" in out and "indice minicode" in out and "stdin" in out
+    # stdin trop court : indice différent (vu en vrai : le modèle croyait le programme buggé)
+    out, _ = tools.run_tool("bash", {"command": "python3 ask.py", "stdin": "2\n"})
+    assert "plus de saisies que les 1 lignes" in out
+    assert tools.run_tool("bash", {"command": "cat", "stdin": 5})[1] is True  # stdin doit être du texte
+
+
+def test_bash_preview_shows_typed_input():
+    preview = minicode._preview("bash", {"command": "python3 jeu.py", "stdin": "50\n25\n"})
+    assert "python3 jeu.py" in preview and "50, 25" in preview
 
 
 def test_bash_returns_output_and_exit_code(tmp_path, monkeypatch):

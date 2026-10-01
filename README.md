@@ -138,8 +138,13 @@ dès qu'ils arrivent : la réflexion du modèle en gris après 💭, la réponse
 `stream.get_final_message()` reconstitue le message complet, donc le reste de la boucle ne
 change pas. `MINICODE_THINKING=0` cache la réflexion.
 
-Après chaque appel, une ligne `· 1370 tokens envoyés, 314 reçus, 4.9 s`. **Regarde le
-premier nombre grossir** : c'est tout l'historique, renvoyé à chaque appel.
+Après chaque appel, une ligne `· 2121 tokens envoyés (dont 1603 déjà en cache), 338 reçus, 7.0 s`.
+**Regarde le total grossir** : c'est tout l'historique, renvoyé à chaque appel. La part
+« en cache » est le début de la conversation que le serveur a déjà calculé (*prompt caching*) :
+il ne recalcule que la partie nouvelle. Attention : dans l'API (Ollama comme Anthropic),
+`input_tokens` ne compte **que** la partie hors cache ; le total = `input_tokens` +
+`cache_read_input_tokens`. Une première version de minicode n'affichait que `input_tokens`,
+et le compteur semblait… diminuer.
 
 **Journal.** Chaque session écrit `.minicode/traces/AAAAMMJJ-HHMMSS.jsonl` (dans le projet
 où tu lances minicode ; `MINICODE_TRACE=0` pour désactiver) :
@@ -150,7 +155,7 @@ où tu lances minicode ; `MINICODE_TRACE=0` pour désactiver) :
 uv run show_trace.py              # résumé lisible du dernier journal (ce qui est AJOUTÉ à chaque appel)
 uv run show_trace.py --call 2     # la requête brute complète de l'appel n°2
 # avec jq : la croissance de l'historique, appel par appel
-jq -c 'select(.type=="call") | {msgs: (.request_messages|length), tokens: .usage.input_tokens, s: .seconds}' .minicode/traces/*.jsonl
+jq -c 'select(.type=="call") | {msgs: (.request_messages|length), tokens: (.usage.input_tokens + (.usage.cache_read_input_tokens // 0)), s: .seconds}' .minicode/traces/*.jsonl
 ```
 
 **Ce que le journal montre** (essai réel, qwen3:8b, « crée un jeu de devinette ») :
@@ -172,8 +177,32 @@ un écran vide.
 l'eau, mais l'API ne les valide plus. D'où `validate_input()` dans `tools.py` (utile aussi
 contre les erreurs des petits modèles) et la relance si le JSON reçu est illisible.
 
+### Tester un programme interactif (`bash` + `stdin`)
+
+`bash` n'a pas de clavier : un programme qui fait `input()` reçoit « fin de saisie » et plante
+(`EOFError`). Le paramètre optionnel `stdin` envoie du texte comme s'il était tapé, une ligne par
+saisie. Ce qu'on a appris en le testant avec qwen3:8b sur le jeu de devinette :
+
+| Essai | Ce que le modèle a fait | Correction dans le harness |
+|---|---|---|
+| 1 | a recopié l'exemple `"50\n75\n62\n"` de la description de l'outil | plus d'exemple concret : **les petits modèles recopient les exemples** |
+| 2 | a inventé que le jeu demandait un nom, sans lire le fichier ; puis a dit à l'utilisateur de fournir les saisies | consignes : « lis le programme avant de le tester », « vérifie toi-même » |
+| 3 | a remplacé le nombre aléatoire par `50` pour que son test passe | consigne : « ne modifie jamais un programme juste pour qu'un test passe ». Sans YOLO, la demande de permission t'aurait montré `+ number = 50` |
+| 4 | test réussi : `EOFError` → indice → relance avec plus de saisies → « Félicitations! », code 0 | — |
+
+Et à l'essai 4, son **résumé était inventé** (« 6 coups, 64 → Félicitations ») alors que le
+journal montre 2 coups, sur 75. Ne crois pas le récit de l'agent : vérifie avec le journal.
+
+```bash
+# ce que les commandes ont VRAIMENT affiché (les tool_result du journal)
+jq -r 'select(.type=="call") | .request_messages[-1].content | if type=="array" then .[] | select(.type=="tool_result") | .content else empty end' .minicode/traces/FICHIER.jsonl
+```
+
 **Exercices :**
 - Pose 5 questions à la suite, puis lance la commande `jq` ci-dessus : comment évolue `tokens` ?
+- Énigme : sur un vrai journal, le total est passé de 2662 à 1589 tokens alors qu'on avait
+  ajouté des messages. Piste : compare ce qui est envoyé (`--call N`) et ce que qwen3 garde
+  de ses anciennes réflexions (bloc `thinking`).
 - Avec `--call N`, retrouve dans la requête brute le `tool_use_id` qui relie un `tool_use` à son `tool_result`.
 - Compare la durée de réflexion avec `MINICODE_MODEL=qwen3:4b`.
 

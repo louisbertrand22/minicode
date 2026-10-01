@@ -75,8 +75,10 @@ def main():
     for i, call in enumerate(calls, 1):
         sent = call["request_messages"]
         usage = call.get("usage") or {}
+        cached = usage.get("cache_read_input_tokens") or 0
+        total = (usage.get("input_tokens") or 0) + cached + (usage.get("cache_creation_input_tokens") or 0)
         print(f"{BOLD}── appel {i}{RESET}  {len(sent)} messages envoyés · "
-              f"{usage.get('input_tokens', '?')} tokens → {usage.get('output_tokens', '?')} tokens · "
+              f"{total} tokens (dont {cached} en cache) → {usage.get('output_tokens', '?')} tokens · "
               f"{call['seconds']} s · stop={call['stop_reason']}")
         if len(sent) < seen:
             print(f"{DIM}   (historique plus court qu'avant : nouvelle conversation ou demande annulée){RESET}")

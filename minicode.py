@@ -50,6 +50,12 @@ Méthode :
 - Explore avant de répondre : grep pour trouver où est quelque chose, read_file pour le lire. Ne devine jamais le contenu d'un fichier.
 - Avant de modifier un fichier avec edit_file, lis-le. Fais des modifications petites et ciblées.
 - Après une modification, vérifie ton travail avec bash (par exemple en lançant les tests).
+- Pour tester un programme interactif (input()) : lis-le d'abord avec read_file pour savoir quelles
+  questions il pose, puis passe les réponses dans le paramètre stdin de bash. Si le résultat est
+  aléatoire, choisis des saisies qui marchent quand même (ex : 1 à 100 pour un nombre à deviner).
+- Fais les vérifications toi-même au lieu de demander à l'utilisateur de les faire.
+- Ne modifie JAMAIS un programme juste pour qu'un test passe (par exemple en remplaçant une
+  valeur aléatoire par une valeur fixe) : adapte le test, pas le programme.
 - L'utilisateur peut refuser une action : dans ce cas, ne la retente pas, demande-lui comment procéder.
 
 Réponds de façon concise, en français."""
@@ -140,8 +146,13 @@ def call_model(client, messages, trace=None):
 
     usage = getattr(response, "usage", None)
     if usage:
-        # input_tokens grossit à chaque appel : c'est tout l'historique qu'on renvoie.
-        print(f"{DIM}  · {usage.input_tokens} tokens envoyés, {usage.output_tokens} reçus, {seconds:.1f} s{RESET}")
+        # Le total grossit à chaque appel : c'est tout l'historique qu'on renvoie.
+        # Mais le serveur garde en CACHE le début déjà vu (prompt caching) : seule la
+        # partie nouvelle est vraiment recalculée, d'où input_tokens qui reste petit.
+        cached = (getattr(usage, "cache_read_input_tokens", 0) or 0)
+        total = usage.input_tokens + cached + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        print(f"{DIM}  · {total} tokens envoyés (dont {cached} déjà en cache), "
+              f"{usage.output_tokens} reçus, {seconds:.1f} s{RESET}")
     if trace:
         trace.log_call(messages, response, seconds)
     return response
@@ -159,7 +170,12 @@ def _short(tool_input, limit=60):
 def _preview(name, tool_input, max_lines=15):
     """Montre à l'utilisateur ce que l'outil VA faire, avant qu'il le fasse."""
     if name == "bash":
-        return f"{YELLOW}  $ {tool_input['command']}{RESET}"
+        preview = f"{YELLOW}  $ {tool_input['command']}{RESET}"
+        if tool_input.get("stdin") is not None:
+            typed = tool_input["stdin"].splitlines()
+            shown = ", ".join(typed[:10]) + (f", … ({len(typed)} saisies)" if len(typed) > 10 else "")
+            preview += f"\n{YELLOW}  ⌨ saisies envoyées : {shown}{RESET}"
+        return preview
     if name == "edit_file":
         lines = [f"{YELLOW}  fichier : {tool_input['path']}{RESET}"]
         for prefix, color, key in (("-", RED, "old_string"), ("+", GREEN, "new_string")):

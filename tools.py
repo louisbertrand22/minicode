@@ -129,17 +129,34 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     return f"Modifié : {path}"
 
 
-def bash(command: str) -> str:
-    """Lance une commande shell dans le dossier du projet."""
+def bash(command: str, stdin: str | None = None) -> str:
+    """Lance une commande shell dans le dossier du projet.
+
+    Pas de clavier : un agent ne peut pas taper au milieu d'une commande. Si
+    `stdin` est donné, ce texte est envoyé au programme comme si on le tapait
+    (une ligne par saisie) ; sinon le programme reçoit "fin de saisie" tout de
+    suite, au lieu de bloquer l'agent indéfiniment.
+    """
+    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     try:
         r = subprocess.run(
             command, shell=True, cwd=WORKSPACE, capture_output=True, text=True,
-            timeout=BASH_TIMEOUT,
-            stdin=subprocess.DEVNULL,  # une commande qui attend une saisie ne bloque pas l'agent
+            timeout=BASH_TIMEOUT, **feed,
         )
     except subprocess.TimeoutExpired:
         raise ToolError(f"Commande arrêtée après {BASH_TIMEOUT} s (trop longue ou bloquée).")
     output = (r.stdout + r.stderr).strip() or "(aucune sortie)"
+    if "EOFError" in output:
+        # On aide le modèle à comprendre l'erreur, au lieu de le laisser deviner
+        # (sans indice, il concluait que le programme était buggé).
+        if stdin is None:
+            output += ("\n[indice minicode : ce programme attend des saisies au clavier. Relance la "
+                       "commande avec le paramètre stdin (une ligne par saisie).]")
+        else:
+            output += (f"\n[indice minicode : le programme a demandé plus de saisies que les "
+                       f"{len(stdin.splitlines())} lignes fournies dans stdin. Ce n'est pas un bug du "
+                       "programme. Relance TOI-MÊME bash avec assez de lignes pour aller jusqu'au bout "
+                       "(par exemple, pour un nombre à deviner entre 1 et 100 : les 100 valeurs, une par ligne).]")
     # Le code de sortie est crucial : c'est grâce à lui que le modèle sait si
     # ses tests passent ou non.
     return _truncate(f"{output}\n[code de sortie : {r.returncode}]")
@@ -216,12 +233,23 @@ TOOL_SCHEMAS = [
         "name": "bash",
         "description": (
             "Exécute une commande shell dans le dossier du projet et renvoie sa sortie et son code de "
-            f"sortie (0 = succès). Limite : {BASH_TIMEOUT} s, pas de saisie clavier possible. "
-            "Utile pour lancer les tests (ex: uv run pytest) et vérifier ton travail après une modification."
+            f"sortie (0 = succès). Limite : {BASH_TIMEOUT} s. Utile pour lancer les tests (ex: uv run pytest) "
+            "et vérifier ton travail après une modification. Il n'y a pas de clavier : pour tester un "
+            "programme qui pose des questions (input()), donne les réponses dans stdin."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"command": {"type": "string", "description": "La commande, ex: uv run pytest -q"}},
+            "properties": {
+                "command": {"type": "string", "description": "La commande, ex: uv run pytest -q"},
+                # Pas d'exemple concret ici : les petits modèles RECOPIENT les exemples
+                # (ils envoyaient "50\n75\n62\n" à n'importe quel programme).
+                "stdin": {
+                    "type": "string",
+                    "description": "Optionnel : texte envoyé au programme comme s'il était tapé au clavier, "
+                                   "une ligne par saisie. Prévois une ligne pour CHAQUE question que posera "
+                                   "le programme, sinon il s'arrête avec EOFError.",
+                },
+            },
             "required": ["command"],
             "additionalProperties": False,
         },
@@ -254,6 +282,9 @@ def validate_input(name: str, tool_input) -> None:
     for key in schema["required"]:
         if not isinstance(tool_input.get(key), str):
             raise ToolError(f"Argument manquant ou invalide pour {name} : {key} (texte attendu)")
+    for key, value in tool_input.items():  # les arguments optionnels aussi doivent être du texte
+        if not isinstance(value, str):
+            raise ToolError(f"Argument invalide pour {name} : {key} (texte attendu)")
 
 
 def run_tool(name: str, tool_input: dict) -> tuple[str, bool]:
