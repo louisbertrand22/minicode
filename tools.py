@@ -11,6 +11,7 @@ décide de l'exécuter et de renvoyer le résultat.
 """
 
 import itertools
+import json
 import os
 import pty
 import re
@@ -128,6 +129,72 @@ def _mismatch_hint(text: str, old: str) -> str:
             f"  dans le fichier : {file_line!r}\n  dans ton texte  : {your_line!r}")
 
 
+def _minimal_hunk(old: str, new: str):
+    """Réduit une modification aux seules lignes qui changent (+ 1 ligne de contexte).
+
+    Ex : 18 lignes recopiées pour ajouter `current_attempts = 0` avant `while True:`
+    -> old = ["while True:"], new = ["current_attempts = 0", "while True:"].
+    """
+    a, b = old.split("\n"), new.split("\n")
+    start = 0
+    while start < min(len(a), len(b)) and a[start] == b[start]:
+        start += 1
+    end = 0
+    while end < min(len(a), len(b)) - start and a[-1 - end] == b[-1 - end]:
+        end += 1
+    before = 1 if start > 0 else 0              # une ligne de contexte avant…
+    after = 1 if not before and end > 0 else 0  # …ou après, s'il n'y a rien avant
+    a_hunk = a[start - before:len(a) - end + after]
+    b_hunk = b[start - before:len(b) - end + after]
+    if not any(line.strip() for line in a_hunk):
+        return None
+    return a_hunk, b_hunk
+
+
+def _find_in_file(text: str, old_lines, new_lines):
+    """Retrouve old_lines dans le fichier, même avec une autre indentation, et
+    ré-indente new_lines pareil. Renvoie (old_string, new_string) exacts, ou None."""
+    exact = "\n".join(old_lines)
+    if text.count(exact) == 1:
+        return exact, "\n".join(new_lines)
+    file_lines, n = text.split("\n"), len(old_lines)
+    found = [i for i in range(len(file_lines) - n + 1)
+             if all(file_lines[i + k].strip() == old_lines[k].strip() for k in range(n))]
+    if len(found) != 1:
+        return None  # introuvable ou ambigu : on ne devine pas
+    i = found[0]
+    model_indent = old_lines[0][:len(old_lines[0]) - len(old_lines[0].lstrip())]
+    file_indent = file_lines[i][:len(file_lines[i]) - len(file_lines[i].lstrip())]
+
+    def reindent(line):
+        return file_indent + line[len(model_indent):] if line.startswith(model_indent) else line
+
+    return "\n".join(file_lines[i:i + n]), "\n".join(reindent(line) for line in new_lines)
+
+
+def _ready_made_edit(path: str, text: str, old: str, new: str) -> str:
+    """Propose au modèle l'appel edit_file correct, PRÊT À RECOPIER.
+
+    Les petits modèles n'arrivent pas à « changer d'approche » seuls (qwen3 a refait
+    5 fois le même appel raté), mais ils recopient très bien ce qu'on leur montre.
+    On ne propose que ce qu'on a vérifié : trouvé une seule fois, et Python valide.
+    """
+    hunk = _minimal_hunk(old, new)
+    suggestion = hunk and _find_in_file(text, *hunk)
+    if not suggestion:
+        return ""
+    old_s, new_s = suggestion
+    if text.count(old_s) != 1 or old_s == new_s:
+        return ""
+    try:
+        _check_python_still_valid(path, text, text.replace(old_s, new_s, 1))
+    except ToolError:
+        return ""
+    return ("\n[indice minicode : ta modification tient en quelques lignes. Appelle edit_file avec exactement "
+            f"ces arguments : old_string={json.dumps(old_s, ensure_ascii=False)} "
+            f"new_string={json.dumps(new_s, ensure_ascii=False)}]")
+
+
 def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, str]:
     """Prépare un edit_file SANS rien écrire : renvoie (fichier, nouveau contenu, message).
 
@@ -147,6 +214,7 @@ def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, s
         return p, new_string, f"Fichier créé : {path} ({len(new_string.splitlines())} lignes)"
     if not p.is_file():
         raise ToolError(f"Fichier introuvable : {path}")
+    text = p.read_text()
     if old_string.count("\n") >= MAX_EDIT_LINES:
         # Vu en vrai : qwen3 réécrivait tout le fichier de mémoire. Résultat : une ligne
         # oubliée (bug introduit), puis des erreurs de recopie (« 时间_limit » au lieu de
@@ -154,14 +222,14 @@ def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, s
         raise ToolError(
             f"old_string fait {old_string.count(chr(10)) + 1} lignes : ne recopie pas tout le fichier. "
             "Modifie seulement la ou les lignes concernées (avec au plus une ligne autour pour la "
-            "situer), quitte à faire plusieurs edit_file."
+            "situer), quitte à faire plusieurs edit_file." + _ready_made_edit(path, text, old_string, new_string)
         )
-    text = p.read_text()
     count = text.count(old_string)
     if count == 0:
         raise ToolError(
             "old_string introuvable dans le fichier. " + _mismatch_hint(text, old_string) +
             "\nRecopie le texte exactement (espaces et indentation compris, sans les numéros de ligne)."
+            + _ready_made_edit(path, text, old_string, new_string)
         )
     if count > 1:
         raise ToolError(f"old_string apparaît {count} fois : ajoute des lignes autour pour qu'il soit unique.")

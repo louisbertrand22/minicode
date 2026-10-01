@@ -62,7 +62,9 @@ Méthode :
   Lance les programmes Python avec python3, et utilise des chemins relatifs au projet.
 - Quand l'utilisateur demande de corriger, modifier ou créer quelque chose, FAIS-LE avec les outils
   au lieu de demander « voulez-vous que je le fasse ? » : il valide chaque action dangereuse.
-- Fais les vérifications toi-même au lieu de demander à l'utilisateur de les faire.
+- Fais les vérifications toi-même au lieu de demander à l'utilisateur de les faire. Vérifie le
+  COMPORTEMENT attendu (ex : le compteur d'essais diminue bien), pas seulement l'absence d'erreur.
+- Une variable qui doit garder sa valeur d'un tour de boucle à l'autre s'initialise AVANT la boucle.
 - Ne modifie JAMAIS un programme juste pour qu'un test passe (par exemple en remplaçant une
   valeur aléatoire par une valeur fixe) : adapte le test, pas le programme.
 - L'utilisateur peut refuser une action : dans ce cas, ne la retente pas, demande-lui comment procéder.
@@ -74,6 +76,7 @@ REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui
 # (bloc thinking) : ni outil, ni texte. Le harness les relance une fois.
 NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
 MAX_NUDGES = 1
+MAX_SAME_FAILURES = 3  # au 3e appel identique raté, on arrête la demande
 
 _ui = None
 
@@ -197,7 +200,7 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
     messages.append({"role": "user", "content": user_input})
     nudges = 0
     json_retries = 0
-    failed_calls = set()  # appels qui ont échoué pendant cette demande
+    failed_calls = {}  # appel raté -> nombre de fois, pendant cette demande
 
     for step in range(MAX_STEPS):
         try:
@@ -227,6 +230,7 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
         messages.append({"role": "assistant", "content": response.content})
 
         text_parts = []
+        stuck = False
         tool_results = []
         for block in response.content:
             if block.type == "text" and block.text.strip():  # un texte d'espaces = pas de réponse
@@ -254,10 +258,12 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                 if is_error and allowed:
                     # Les petits modèles refont parfois EXACTEMENT le même appel raté, en boucle.
                     key = json.dumps([block.name, block.input], sort_keys=True)
-                    if key in failed_calls:
+                    failed_calls[key] = failed_calls.get(key, 0) + 1
+                    if failed_calls[key] >= 2:
                         result += ("\n[indice minicode : tu as déjà fait exactement cet appel et il a échoué "
                                    "de la même façon. Change d'approche.]")
-                    failed_calls.add(key)
+                    if failed_calls[key] >= MAX_SAME_FAILURES:
+                        stuck = True
                 ui.tool_result(block.name, block.input, result if allowed else "refusé par l'utilisateur",
                                is_error, diff)
                 tool_results.append({
@@ -281,6 +287,15 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
 
         # TOUS les résultats partent dans UN SEUL message "user".
         messages.append({"role": "user", "content": tool_results})
+
+        if stuck:
+            # Le modèle tourne en boucle malgré les indices : inutile de brûler du temps.
+            # L'historique reste valide (chaque tool_use a son tool_result) : l'utilisateur
+            # peut reformuler, ou faire /clear.
+            message = (f"[arrêt : le modèle a refait {MAX_SAME_FAILURES} fois le même appel raté. "
+                       "Reformule ta demande plus précisément, ou fais la modification toi-même.]")
+            ui.error(message)
+            return message
 
     message = f"[arrêt : {MAX_STEPS} étapes atteintes sans réponse finale]"
     ui.error(message)

@@ -191,6 +191,53 @@ def test_edit_mismatch_says_where_it_diverges(tmp_path, monkeypatch):
     assert "ligne 2" in out and "'import time'" in out  # ligne oubliée par le modèle
 
 
+REAL_GAME = """\
+import time
+
+max_attempts = 7
+while True:
+    print(f"Tentatives restantes: {max_attempts - current_attempts}")
+    guess = int(input("Entrez votre chiffre : "))
+    current_attempts += 1
+    if current_attempts >= max_attempts:
+        break
+"""
+
+
+def test_failed_edit_gets_a_ready_made_fix(tmp_path, monkeypatch):
+    # Cas réel : qwen3 recopiait toute la boucle, décalée de 4 espaces, pour ajouter UNE ligne.
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "jeu.py").write_text(REAL_GAME)
+    loop = REAL_GAME.split("max_attempts = 7\n")[1].rstrip("\n")
+    shifted = "\n".join("    " + line for line in loop.split("\n"))
+    out, is_error = tools.run_tool("edit_file", {"path": "jeu.py", "old_string": shifted,
+                                                 "new_string": "    current_attempts = 0\n" + shifted})
+    assert is_error
+    assert 'old_string="while True:" new_string="current_attempts = 0\\nwhile True:"' in out
+    # et la suggestion, recopiée telle quelle, marche
+    assert tools.run_tool("edit_file", {"path": "jeu.py", "old_string": "while True:",
+                                        "new_string": "current_attempts = 0\nwhile True:"})[1] is False
+
+
+def test_no_suggestion_when_ambiguous(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "f.py").write_text("x = 1\nbreak_me = 0\nx = 1\n")
+    out, _ = tools.run_tool("edit_file", {"path": "f.py", "old_string": "  x = 1", "new_string": "  x = 2"})
+    assert "introuvable" in out and "Appelle edit_file avec exactement" not in out  # 2 endroits possibles : on ne devine pas
+
+
+def test_same_failed_call_three_times_stops_the_turn(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "f.py").write_text("a = 1\n")
+    bad = lambda id: NS(stop_reason="tool_use", content=[tool_use(id, "edit_file", path="f.py", old_string="zzz", new_string="y")])
+    client = FakeClient(bad("t1"), bad("t2"), bad("t3"), bad("t4"))
+    messages = []
+    out = minicode.run_turn(client, messages, "modifie", confirm=lambda n, i: True, ui=TerminalUI())
+    assert "3 fois le même appel raté" in out
+    assert len(client.requests) == 3  # le 4e appel au modèle n'a pas eu lieu
+    assert messages[-1]["role"] == "user" and messages[-1]["content"][0]["tool_use_id"] == "t3"  # historique valide
+
+
 def test_edit_that_breaks_python_is_refused(tmp_path, monkeypatch):
     # Cas réel : qwen3 a perdu l'indentation d'une ligne en « corrigeant » le jeu.
     monkeypatch.setattr(tools, "WORKSPACE", tmp_path)

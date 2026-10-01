@@ -284,9 +284,12 @@ class TerminalUI:
     def tool_result(self, name, tool_input, result, is_error, diff_rows=None):
         lines = result.splitlines()
         if is_error:
-            summary = Text(lines[0] if lines else "erreur", style="red")
-            for note in (line for line in lines[1:] if line.startswith("[indice minicode")):
-                summary.append("\n" + note, style="yellow")
+            # Le message d'erreur en entier (les détails utiles sont souvent après la 1re ligne :
+            # « dans le fichier : … / dans ton texte : … »), les indices en jaune.
+            summary = Text()
+            for line in lines[:8] or ["erreur"]:
+                style = "yellow" if line.startswith("[indice minicode") else "red"
+                summary.append(("\n" if summary.plain else "") + line, style=style)
             self.console.print(_result_line(summary))
             return
         if name == "read_file":
