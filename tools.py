@@ -239,12 +239,30 @@ TOOL_FUNCTIONS = {
 }
 
 
+SCHEMAS_BY_NAME = {s["name"]: s["input_schema"] for s in TOOL_SCHEMAS}
+
+
+def validate_input(name: str, tool_input) -> None:
+    """Vérifie les arguments AVANT d'exécuter : ne jamais faire confiance à ce que
+    renvoie le modèle (un petit modèle se trompe, et en streaming un JSON peut être tronqué)."""
+    schema = SCHEMAS_BY_NAME[name]
+    if not isinstance(tool_input, dict):
+        raise ToolError(f"Arguments invalides pour {name} : un objet JSON est attendu.")
+    unknown = set(tool_input) - set(schema["properties"])
+    if unknown:
+        raise ToolError(f"Arguments inconnus pour {name} : {', '.join(sorted(unknown))}")
+    for key in schema["required"]:
+        if not isinstance(tool_input.get(key), str):
+            raise ToolError(f"Argument manquant ou invalide pour {name} : {key} (texte attendu)")
+
+
 def run_tool(name: str, tool_input: dict) -> tuple[str, bool]:
     """Exécute un outil. Renvoie (résultat, is_error)."""
     fn = TOOL_FUNCTIONS.get(name)
     if fn is None:
         return f"Outil inconnu : {name}", True
     try:
+        validate_input(name, tool_input)
         return fn(**tool_input), False
     except ToolError as e:
         return str(e), True

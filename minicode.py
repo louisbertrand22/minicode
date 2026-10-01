@@ -9,6 +9,8 @@
   4. Outils qui AGISSENT : grep, edit_file, bash (l'agent peut modifier et vérifier).
   5. Permissions   -> le harness demande avant edit_file et bash, sauf si une
                       règle de .minicode/permissions.json décide (voir permissions.py).
+  7. Streaming + journal -> la réponse s'affiche mot à mot, et chaque échange est
+                      enregistré dans .minicode/traces/ (voir tracelog.py, show_trace.py).
 
 Lancer :  uv run minicode.py      (dans le dossier du projet à explorer)
 
@@ -21,11 +23,13 @@ Deux "fournisseurs" de modèle, même boucle :
 
 import os
 import sys
+import time
 
 import anthropic
 
 import permissions
-from tools import DANGEROUS_TOOLS, TOOL_SCHEMAS, WORKSPACE, run_tool
+from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, run_tool
+from tracelog import Trace
 
 PROVIDER = os.environ.get("MINICODE_PROVIDER", "ollama")  # ollama | anthropic
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -36,6 +40,8 @@ MAX_STEPS = 30  # garde-fou : nombre max d'appels au modèle pour UNE demande
 # MINICODE_YOLO=1 : accepte tout sans demander (comme le mode sans permissions de
 # Claude Code). Pratique pour les tests automatiques, dangereux sur un vrai projet.
 YOLO = os.environ.get("MINICODE_YOLO") == "1"
+SHOW_THINKING = os.environ.get("MINICODE_THINKING", "1") != "0"  # 0 = cacher la réflexion
+TRACE = os.environ.get("MINICODE_TRACE", "1") != "0"             # 0 = pas de journal
 
 SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
 Tu travailles dans le projet situé à : {WORKSPACE}
@@ -65,26 +71,80 @@ def make_client():
     return anthropic.Anthropic()  # lit ANTHROPIC_API_KEY dans l'environnement
 
 
-def call_model(client, messages):
-    """UN appel au modèle. Tout le "cerveau" est là ; tout le reste est du harness."""
-    params = dict(
-        model=MODEL,
-        max_tokens=16000,
-        system=SYSTEM_PROMPT,
-        tools=TOOL_SCHEMAS,
-        messages=messages,
-    )
+class LivePrinter:
+    """Affiche le flux au fil de l'eau : la réflexion en gris (💭), la réponse en normal."""
+
+    def __init__(self):
+        self.kind = None  # ce qu'on est en train d'afficher : None, "thinking" ou "text"
+
+    def show(self, kind, chunk):
+        if kind == "thinking" and not SHOW_THINKING:
+            return
+        if kind != self.kind:
+            self.end()
+            if kind == "thinking":
+                print(f"{DIM}  💭 ", end="")  # gris jusqu'au RESET de end()
+            self.kind = kind
+        print(chunk, end="", flush=True)
+
+    def end(self):
+        if self.kind:
+            print(RESET)  # fin de la couleur + retour à la ligne
+            self.kind = None
+
+
+def request_params(messages):
+    """Exactement ce qu'on envoie au modèle (hors en-têtes HTTP)."""
+    params = dict(model=MODEL, system=SYSTEM_PROMPT, messages=messages)
     if PROVIDER == "ollama":
         # Ollama ne connaît que l'API de base (pas les options bêta ci-dessous).
-        return client.messages.create(**params)
-    return client.beta.messages.create(
+        return {**params, "max_tokens": 16000, "tools": TOOL_SCHEMAS}
+    return {
         **params,
-        output_config={"effort": EFFORT},
+        "max_tokens": 64000,  # en streaming, pas de risque de timeout : on laisse de la marge
+        # eager_input_streaming : les arguments d'un outil (ex : tout un fichier pour
+        # edit_file) arrivent au fil de l'eau. Contrepartie : l'API ne les valide plus,
+        # c'est run_tool() qui vérifie qu'ils sont complets.
+        "tools": [{**t, "eager_input_streaming": True} for t in TOOL_SCHEMAS],
+        "thinking": {"type": "adaptive", "display": "summarized"},  # sinon la réflexion arrive vide
+        "output_config": {"effort": EFFORT},
         # Si un filtre de sécurité refuse la requête, l'API la rejoue sur un
         # autre modèle au lieu d'échouer (paramètre côté serveur, en bêta).
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-    )
+        "betas": ["server-side-fallback-2026-07-01"],
+        "fallbacks": "default",
+    }
+
+
+def call_model(client, messages, trace=None):
+    """UN appel au modèle, en STREAMING (étape 7).
+
+    Au lieu d'attendre la réponse complète, on reçoit des petits événements
+    ("thinking", "text"...) qu'on affiche dès qu'ils arrivent. À la fin, le SDK
+    reconstitue le message complet (get_final_message), identique à ce que
+    renverrait un appel normal : le reste de la boucle ne change pas.
+    """
+    api = client.messages if PROVIDER == "ollama" else client.beta.messages
+    printer = LivePrinter()
+    start = time.time()
+    try:
+        with api.stream(**request_params(messages)) as stream:
+            for event in stream:
+                if event.type == "thinking":
+                    printer.show("thinking", event.thinking)
+                elif event.type == "text":
+                    printer.show("text", event.text)
+            response = stream.get_final_message()
+    finally:
+        printer.end()
+    seconds = time.time() - start
+
+    usage = getattr(response, "usage", None)
+    if usage:
+        # input_tokens grossit à chaque appel : c'est tout l'historique qu'on renvoie.
+        print(f"{DIM}  · {usage.input_tokens} tokens envoyés, {usage.output_tokens} reçus, {seconds:.1f} s{RESET}")
+    if trace:
+        trace.log_call(messages, response, seconds)
+    return response
 
 
 def _short(tool_input, limit=60):
@@ -141,18 +201,37 @@ def ask_permission(name, tool_input):
     return answer in ("o", "oui", "y", "yes")
 
 
-def run_turn(client, messages, user_input, confirm=ask_permission):
+def _harness_message(text):
+    """Un message du harness (pas du modèle) : affiché en couleur ET renvoyé."""
+    print(text)
+    return text
+
+
+def run_turn(client, messages, user_input, confirm=ask_permission, trace=None):
     """Traite une demande utilisateur : la BOUCLE D'AGENT (étape 3).
 
-    Modifie `messages` sur place. Renvoie le texte final du modèle.
-    `confirm(name, input) -> bool` est appelé avant chaque outil dangereux.
+    Modifie `messages` sur place. Renvoie le texte final du modèle (déjà affiché
+    pendant le streaming). `confirm(name, input) -> bool` est appelé avant chaque
+    outil dangereux.
     """
     turn_start = len(messages)
     messages.append({"role": "user", "content": user_input})
     nudges = 0
+    json_retries = 0
 
     for step in range(MAX_STEPS):
-        response = call_model(client, messages)
+        try:
+            response = call_model(client, messages, trace)
+        except ValueError:
+            # En streaming, les arguments d'un outil arrivent par morceaux de JSON.
+            # S'ils sont illisibles, il n'y a pas de tool_use complet à qui répondre :
+            # on refait simplement l'appel (au plus 2 fois de suite).
+            json_retries += 1
+            if json_retries > 2:
+                raise
+            print(f"{DIM}  (arguments d'outil illisibles, minicode relance l'appel){RESET}")
+            continue
+        json_retries = 0
 
         # Important : on ajoute `response.content` TEL QUEL (pas seulement le texte).
         # Il contient les blocs tool_use (dont l'API a besoin pour relier les
@@ -161,7 +240,7 @@ def run_turn(client, messages, user_input, confirm=ask_permission):
             # Réponse inutilisable (et peut-être un tool_use tronqué) : on annule
             # toute la demande pour garder un historique valide.
             del messages[turn_start:]
-            return f"{RED}[arrêt : {response.stop_reason}] Demande annulée, reformule-la.{RESET}"
+            return _harness_message(f"{RED}[arrêt : {response.stop_reason}] Demande annulée, reformule-la.{RESET}")
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -194,23 +273,25 @@ def run_turn(client, messages, user_input, confirm=ask_permission):
                 messages.append({"role": "user", "content": NUDGE})
                 continue
             # Le modèle n'a plus besoin d'outils : la demande est terminée.
-            return "\n".join(text_parts) or f"{DIM}(le modèle n'a rien répondu){RESET}"
-
-        # Texte intermédiaire éventuel ("je vais regarder le fichier X...").
-        if text_parts:
-            print(f"{DIM}{' '.join(text_parts)}{RESET}")
+            return "\n".join(text_parts) or _harness_message(f"{DIM}(le modèle n'a rien répondu){RESET}")
 
         # TOUS les résultats partent dans UN SEUL message "user".
         messages.append({"role": "user", "content": tool_results})
 
-    return f"{RED}[arrêt : {MAX_STEPS} étapes atteintes sans réponse finale]{RESET}"
+    return _harness_message(f"{RED}[arrêt : {MAX_STEPS} étapes atteintes sans réponse finale]{RESET}")
 
 
 def main():
     client = make_client()
     messages = []  # TOUT l'état de la conversation tient dans cette liste
+    trace = None
+    if TRACE:
+        trace = Trace(WORKSPACE / PROTECTED_DIR / "traces",
+                      provider=PROVIDER, model=MODEL, system=SYSTEM_PROMPT, tools=TOOL_SCHEMAS)
 
     print(f"minicode — {PROVIDER} / {MODEL}, projet {WORKSPACE}")
+    if trace:
+        print(f"{DIM}journal : {trace.path}{RESET}")
     print("Tape ta demande (Ctrl-D ou 'exit' pour quitter).\n")
     while True:
         try:
@@ -224,7 +305,8 @@ def main():
             continue
         start = len(messages)
         try:
-            print(run_turn(client, messages, user_input), "\n")
+            run_turn(client, messages, user_input, trace=trace)  # la réponse s'affiche en direct
+            print()
         except anthropic.AuthenticationError:
             sys.exit(f"{RED}Clé API invalide ou absente : exporte ANTHROPIC_API_KEY.{RESET}")
         except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:

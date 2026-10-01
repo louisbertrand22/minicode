@@ -77,7 +77,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 4. Outils qui agissent : `grep`, `edit_file` (remplacement exact), `bash` (+ relance si réponse vide)
 - [x] 5. Permissions : o/t/N avant `bash` et `edit_file`, règles allow/deny dans `.minicode/permissions.json`
 - [ ] 6. Contexte projet : charger un `AGENTS.md` dans le prompt système
-- [ ] 7. Streaming + journal JSONL de chaque requête/réponse (le plus instructif !)
+- [x] 7. Streaming (réflexion 💭 + réponse en direct, tokens par appel) + journal JSONL + `show_trace.py`
 - [ ] 8. Gestion du contexte : compter les tokens, résumer les vieux tours
 - [ ] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte
 - [ ] 10. Évals : 10 petites tâches, score de réussite / nombre de tours / coût
@@ -130,6 +130,52 @@ ajoutent un **bac à sable** (conteneur, VM) qui limite ce que les commandes peu
   un script (indice : `python3 -c`). Que faudrait-il changer pour la bloquer ?
 - Mets `MAX_NUDGES = 0` et répète une demande de correction plusieurs fois : combien de
   réponses vides obtiens-tu ?
+
+## Étape 7 : voir ce qui se passe sous le capot
+
+**Streaming.** La réponse arrive en petits morceaux (événements `thinking`, `text`) affichés
+dès qu'ils arrivent : la réflexion du modèle en gris après 💭, la réponse en normal. À la fin,
+`stream.get_final_message()` reconstitue le message complet, donc le reste de la boucle ne
+change pas. `MINICODE_THINKING=0` cache la réflexion.
+
+Après chaque appel, une ligne `· 1370 tokens envoyés, 314 reçus, 4.9 s`. **Regarde le
+premier nombre grossir** : c'est tout l'historique, renvoyé à chaque appel.
+
+**Journal.** Chaque session écrit `.minicode/traces/AAAAMMJJ-HHMMSS.jsonl` (dans le projet
+où tu lances minicode ; `MINICODE_TRACE=0` pour désactiver) :
+- 1re ligne : le prompt système et les outils ;
+- puis une ligne par appel : la liste `messages` **complète** envoyée, la réponse, les tokens.
+
+```bash
+uv run show_trace.py              # résumé lisible du dernier journal (ce qui est AJOUTÉ à chaque appel)
+uv run show_trace.py --call 2     # la requête brute complète de l'appel n°2
+# avec jq : la croissance de l'historique, appel par appel
+jq -c 'select(.type=="call") | {msgs: (.request_messages|length), tokens: .usage.input_tokens, s: .seconds}' .minicode/traces/*.jsonl
+```
+
+**Ce que le journal montre** (essai réel, qwen3:8b, « crée un jeu de devinette ») :
+
+```
+── appel 1  1 messages envoyés · 847 tokens → 1343 tokens · 21.03 s · stop=tool_use
+   + user      texte       Crée un petit jeu en python dans jeu.py …
+   ← modèle    réflexion   Okay, the user wants me to create a simple number guessing game…
+   ← modèle    tool_use    edit_file({"new_string": "import random\n\nnumber = …
+── appel 2  3 messages envoyés · 1370 tokens → 314 tokens · 4.94 s · stop=end_turn
+   + user      tool_result Fichier créé : jeu.py (13 lignes)
+   ← modèle    texte       Le fichier `jeu.py` a été créé avec le code du jeu. …
+```
+
+Sur 21 s, presque tout est de la réflexion (1343 tokens) : sans streaming, tu aurais regardé
+un écran vide.
+
+**Côté Anthropic** : `eager_input_streaming` fait arriver les arguments d'outils au fil de
+l'eau, mais l'API ne les valide plus. D'où `validate_input()` dans `tools.py` (utile aussi
+contre les erreurs des petits modèles) et la relance si le JSON reçu est illisible.
+
+**Exercices :**
+- Pose 5 questions à la suite, puis lance la commande `jq` ci-dessus : comment évolue `tokens` ?
+- Avec `--call N`, retrouve dans la requête brute le `tool_use_id` qui relie un `tool_use` à son `tool_result`.
+- Compare la durée de réflexion avec `MINICODE_MODEL=qwen3:4b`.
 
 ## Exercices pour les étapes 1–3
 

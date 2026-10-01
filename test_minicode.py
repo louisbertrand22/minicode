@@ -9,6 +9,7 @@ from types import SimpleNamespace as NS
 import minicode
 import permissions
 import tools
+from tracelog import Trace
 
 
 def text(t):
@@ -19,18 +20,42 @@ def tool_use(id, name, **input):
     return NS(type="tool_use", id=id, name=name, input=input)
 
 
+class FakeStream:
+    """Imite `client.messages.stream(...)` : un bloc `with` qui émet des événements
+    (un par bloc ici, au lieu d'un par morceau de mot), puis get_final_message()."""
+
+    def __init__(self, response):
+        self.response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        for block in self.response.content:
+            if block.type == "thinking":
+                yield NS(type="thinking", thinking=block.thinking)
+            elif block.type == "text":
+                yield NS(type="text", text=block.text)
+
+    def get_final_message(self):
+        return self.response
+
+
 class FakeClient:
     """Renvoie les réponses scriptées dans l'ordre, et garde une copie de chaque requête."""
 
     def __init__(self, *responses):
         self.responses = list(responses)
         self.requests = []
-        self.messages = NS(create=self._create)           # API de base (Ollama)
-        self.beta = NS(messages=NS(create=self._create))  # API bêta (Anthropic)
+        self.messages = NS(stream=self._stream)           # API de base (Ollama)
+        self.beta = NS(messages=NS(stream=self._stream))  # API bêta (Anthropic)
 
-    def _create(self, **kwargs):
+    def _stream(self, **kwargs):
         self.requests.append({**kwargs, "messages": list(kwargs["messages"])})
-        return self.responses.pop(0)
+        return FakeStream(self.responses.pop(0))
 
 
 def test_plain_chat_sends_full_history(tmp_path, monkeypatch):
@@ -87,6 +112,61 @@ def test_anthropic_gets_effort_and_fallbacks(monkeypatch):
     minicode.run_turn(client, [], "salut")
     assert client.requests[0]["fallbacks"] == "default"
     assert client.requests[0]["output_config"] == {"effort": minicode.EFFORT}
+
+
+def test_eager_input_streaming_only_for_anthropic(monkeypatch):
+    for provider, expected in (("anthropic", True), ("ollama", None)):
+        monkeypatch.setattr(minicode, "PROVIDER", provider)
+        tools_sent = minicode.request_params([])["tools"]
+        assert all(t.get("eager_input_streaming") is expected for t in tools_sent), provider
+
+
+# --- Étape 7 : streaming et journal ---------------------------------------------
+
+def test_stream_prints_text_live_and_thinking_dimmed(capsys, monkeypatch):
+    monkeypatch.setattr(minicode, "SHOW_THINKING", True)
+    client = FakeClient(NS(stop_reason="end_turn", content=[NS(type="thinking", thinking="hmm"), text("Bonjour")],
+                           usage=NS(input_tokens=120, output_tokens=7)))
+    minicode.run_turn(client, [], "salut")
+    out = capsys.readouterr().out
+    assert "💭" in out and "hmm" in out and "Bonjour" in out
+    assert "120 tokens envoyés, 7 reçus" in out
+
+
+def test_trace_records_every_call_with_full_history(tmp_path):
+    trace = Trace(tmp_path, provider="ollama", model="m", system="sys", tools=[])
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("t1", "list_dir", path=".")], usage=NS(input_tokens=10, output_tokens=2)),
+        NS(stop_reason="end_turn", content=[text("fini")], usage=NS(input_tokens=30, output_tokens=1)),
+    )
+    minicode.run_turn(client, [], "explore", trace=trace)
+    lines = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert [line["type"] for line in lines] == ["session", "call", "call"]
+    assert lines[0]["system"] == "sys"
+    # 1er appel : 1 message envoyé ; 2e appel : 3 (user, assistant/tool_use, user/tool_result)
+    assert len(lines[1]["request_messages"]) == 1 and len(lines[2]["request_messages"]) == 3
+    assert lines[2]["request_messages"][2]["content"][0]["type"] == "tool_result"
+    assert lines[2]["response_content"] == [{"type": "text", "text": "fini"}]
+
+
+def test_unreadable_tool_json_is_retried():
+    calls = iter([ValueError("bad json"), NS(stop_reason="end_turn", content=[text("ok")])])
+
+    def flaky_stream(**kwargs):
+        item = next(calls)
+        if isinstance(item, Exception):
+            raise item
+        return FakeStream(item)
+
+    client = NS(messages=NS(stream=flaky_stream), beta=NS(messages=NS(stream=flaky_stream)))
+    assert minicode.run_turn(client, [], "salut") == "ok"
+
+
+def test_tool_inputs_are_validated():
+    assert "manquant" in tools.run_tool("read_file", {})[0]
+    assert "inconnus" in tools.run_tool("read_file", {"path": "a", "mode": "w"})[0]
+    assert "manquant" in tools.run_tool("bash", {"command": 42})[0]
+    assert tools.run_tool("read_file", "pas un dict")[1] is True
 
 
 def test_ollama_client_points_to_local_server(monkeypatch):
