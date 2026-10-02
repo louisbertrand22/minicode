@@ -224,13 +224,18 @@ def setup(task, workdir):
         target.write_text(content)
 
 
+def prepare(task, workdir):
+    """Le dossier d'une tâche : ses fichiers de départ + les règles deny (sudo, installations…)."""
+    setup(task, workdir)
+    rules = Path(workdir) / ".minicode" / "permissions.json"
+    rules.parent.mkdir(exist_ok=True)
+    rules.write_text(json.dumps({"allow": [], "deny": EVAL_DENY}, indent=1))
+
+
 def run_task(task, root):
     """Prépare le dossier, lance minicode dessus, puis vérifie. Renvoie un dict de résultats."""
     workdir = Path(tempfile.mkdtemp(prefix=f"{task.name}-", dir=root))
-    setup(task, workdir)
-    rules = workdir / ".minicode" / "permissions.json"
-    rules.parent.mkdir(exist_ok=True)
-    rules.write_text(json.dumps({"allow": [], "deny": EVAL_DENY}, indent=1))
+    prepare(task, workdir)
     result_file, log_file = workdir / ".resultat.json", workdir / ".minicode-sortie.txt"
     env = {**os.environ, "MINICODE_YOLO": "1", "MINICODE_TRACE": "1"}
     with log_file.open("w") as log:

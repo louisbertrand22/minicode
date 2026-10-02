@@ -854,5 +854,23 @@ def test_eval_checks_accept_a_good_solution_and_reject_the_start(task, tmp_path)
     assert not task.check(untouched, [""] * len(task.prompts))[0]
 
 
+def test_eval_workspaces_deny_sudo_even_in_yolo_mode(tmp_path, monkeypatch, capsys):
+    """Vu au 1er run : bloqué, qwen3 a tenté `sudo pacman -S`. En éval (YOLO), deny doit gagner."""
+    evals.prepare(evals.TASKS[2], tmp_path)
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(minicode, "YOLO", True)
+    for command in ("sudo pacman -S python-pytest", "cd . && sudo rm -rf x", "pip install pytest"):
+        assert permissions.decide("bash", {"command": command})[0] == "deny", command
+    assert permissions.decide("bash", {"command": "python3 test_calc.py"})[0] == "ask"  # le reste passe (YOLO)
+
+    client = FakeClient(NS(stop_reason="tool_use", content=[tool_use("b", "bash", command="sudo pacman -S python-pytest")]),
+                        NS(stop_reason="end_turn", content=[text("Je ne peux pas.")]))
+    minicode.run_turn(client, [], "installe pytest")
+    result = client.requests[1]["messages"][-1]["content"][0]
+    assert result["is_error"] and "refusé" in result["content"]  # rien n'a été exécuté
+    out = plain(capsys.readouterr().out)
+    assert "interdit par la règle bash(" in out and "sudo" in out.split("interdit par la règle", 1)[1]
+
+
 def test_there_are_ten_distinct_tasks():
     assert len(evals.TASKS) == 10 and len({t.name for t in evals.TASKS}) == 10
