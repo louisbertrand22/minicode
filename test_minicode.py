@@ -453,6 +453,65 @@ def test_empty_answer_is_nudged_once():
     assert len(client.requests) == 2
 
 
+HANDS_OFF_ANSWER = "Le bug est ligne 2 : add soustrait. Corrigez la ligne 2 avec `return a + b`."
+
+
+def test_described_fix_is_relaunched_once(tmp_path, monkeypatch):
+    """Vu aux évals : le modèle trouve le bug, écrit « Corrigez… » et s'arrête sans rien faire."""
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    client = FakeClient(
+        NS(stop_reason="end_turn", content=[text(HANDS_OFF_ANSWER)]),
+        NS(stop_reason="tool_use", content=[tool_use("e", "edit_file", path="calc.py",
+                                                     old_string="return a - b", new_string="return a + b")]),
+        NS(stop_reason="end_turn", content=[text("Corrigé : add additionne.")]),
+    )
+    messages = []
+    assert minicode.run_turn(client, messages, "Corrige le bug de calc.py", confirm=lambda *a: True) \
+        == "Corrigé : add additionne."
+    assert messages[2] == {"role": "user", "content": minicode.DO_IT}
+    assert "a + b" in (tmp_path / "calc.py").read_text()
+
+
+def test_described_fix_with_a_tool_call_gets_the_reminder_with_the_results(tmp_path, monkeypatch):
+    """Vu sur corriger_shell : « Corrigez la ligne 4 » PUIS il lance les tests, sans rien corriger."""
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[text(HANDS_OFF_ANSWER), tool_use("l", "list_dir", path=".")]),
+        NS(stop_reason="end_turn", content=[text("Je ne peux pas : calc.py n'existe pas.")]),
+    )
+    minicode.run_turn(client, [], "Corrige le bug de calc.py")
+    results = client.requests[1]["messages"][-1]["content"]
+    assert results[0]["type"] == "tool_result" and results[-1] == {"type": "text", "text": minicode.DO_IT}
+    assert len(client.requests) == 2  # pas d'appel en plus
+
+
+def test_no_relaunch_for_questions_after_edits_or_twice(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    # Une QUESTION : expliquer comment corriger est la bonne réponse.
+    client = FakeClient(NS(stop_reason="end_turn", content=[text(HANDS_OFF_ANSWER)]))
+    assert minicode.run_turn(client, [], "Pourquoi add donne un mauvais résultat ?") == HANDS_OFF_ANSWER
+    assert len(client.requests) == 1
+    # Après une modification réussie, « vous pouvez relancer… » n'est pas un abandon.
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("e", "edit_file", path="calc.py",
+                                                     old_string="return a - b", new_string="return a + b")]),
+        NS(stop_reason="end_turn", content=[text("Corrigé. Vous pouvez relancer les tests.")]))
+    minicode.run_turn(client, [], "Corrige add", confirm=lambda *a: True)
+    assert len(client.requests) == 2
+    # Relancé, il répond juste « OK » sans agir : on garde sa 1re réponse, et on s'arrête.
+    client = FakeClient(NS(stop_reason="end_turn", content=[text(HANDS_OFF_ANSWER)]),
+                        NS(stop_reason="end_turn", content=[text("OK.")]))
+    assert minicode.run_turn(client, [], "Corrige le bug de calc.py") == HANDS_OFF_ANSWER
+    assert len(client.requests) == 2
+    # Au plus MAX_DO_IT rappels, même s'il continue de décrire (« Corrigeons… » compte aussi).
+    announce = NS(stop_reason="end_turn", content=[text("Corrigeons le motif pour qu'il marche.")])
+    client = FakeClient(*[announce] * (minicode.MAX_DO_IT + 1))
+    minicode.run_turn(client, [], "Corrige le bug de calc.py")
+    assert len(client.requests) == minicode.MAX_DO_IT + 1
+
+
 def must_not_ask(name):
     raise AssertionError(f"{name} ne devrait pas demander la permission")
 

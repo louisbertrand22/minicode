@@ -33,6 +33,7 @@ Deux "fournisseurs" de modèle, même boucle :
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -107,6 +108,29 @@ DENIED_BY_RULE = ("Action interdite par la règle de permission {rule} (.minicod
 # (bloc thinking) : ni outil, ni texte. Le harness les relance une fois.
 NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
 MAX_NUDGES = 1
+# Vu aux évals (3 échecs sur 5, puis 2 sur 2) : qwen3 trouve le bug puis écrit « Corrigez la
+# ligne 4 » au lieu d'appeler edit_file. Il n'y a plus d'outil demandé, donc la boucle
+# s'arrête. Le harness repère ce cas et rappelle UNE fois au modèle que c'est à lui d'agir.
+DO_IT = ("[minicode] Tu as décrit ce qu'il faudrait faire, mais tu ne l'as pas fait. L'utilisateur t'a "
+         "demandé d'agir : fais-le maintenant avec les outils (edit_file pour modifier, puis bash pour "
+         "vérifier). Si c'est vraiment impossible (information manquante, action refusée), dis pourquoi "
+         "en une phrase.")
+# Les 3 conditions pour relancer (sinon on gênerait une simple question) :
+# 1. la demande est une ACTION ;
+ACTION_REQUEST = re.compile(
+    r"\b(corrige[rz]?|répare[rz]?|modifie[rz]?|change[rz]?|crée[rz]?|ajoute[rz]?|renomme[rz]?|"
+    r"supprime[rz]?|remplace[rz]?|déplace[rz]?|implémente[rz]?|mets|mettez|écris|écrivez|fix|refactor)\b",
+    re.IGNORECASE)
+# 2. la réponse RENVOIE le travail à l'utilisateur (« Corrigez… »), ANNONCE une action sans la
+#    faire (« Corrigeons le motif. » puis rien), ou décrit un appel d'outil au lieu de le faire ;
+HANDS_OFF = re.compile(
+    r"\b(corrigez|appliquez|modifiez|remplacez|ajoutez|déplacez|supprimez|changez|exécutez|lancez|"
+    r"corrigeons|appliquons|modifions|remplaçons|ajoutons|déplaçons|changeons|"
+    r"il faudrait|il faut|vous pouvez|vous devez|vous devriez|tu peux|tu dois|tu devrais|"
+    r"je vais (corriger|modifier|remplacer|ajouter|changer)|edit_file|start_line)\b|"
+    r"voici la (modification|correction)", re.IGNORECASE)
+MAX_DO_IT = 2  # vu aux évals : relancé une fois, qwen3 réécrit parfois « Exécutez… » sans agir
+# 3. aucune modification n'a été faite pendant la demande (vérifié dans la boucle).
 MAX_SAME_FAILURES = 3  # au 3e appel identique raté, on arrête la demande
 # Étape 9 : l'agent principal a en plus l'outil `task` ; un sous-agent n'a que la lecture.
 MAIN_TOOLS = TOOL_SCHEMAS + [subagent.TASK_SCHEMA]
@@ -394,6 +418,11 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
     nudges = 0
     json_retries = 0
     failed_calls = {}  # appel raté -> nombre de fois, pendant cette demande
+    acting = bool(ACTION_REQUEST.search(user_input))  # l'utilisateur demande d'AGIR
+    edited = False      # une modification a-t-elle réussi pendant la demande ?
+    described = None    # le 1er texte où le modèle a décrit l'action au lieu de la faire
+    do_its = 0          # nombre de rappels DO_IT envoyés
+    tools_after_do_it = 0
 
     for step in range(MAX_STEPS):
         turn_start = fit_context(client, messages, turn_start, trace, ui)
@@ -470,6 +499,10 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                                    "de la même façon. Change d'approche.]")
                     if failed_calls[key] >= MAX_SAME_FAILURES:
                         stuck = True
+                if block.name == "edit_file" and allowed and not is_error:
+                    edited = True
+                if described is not None:
+                    tools_after_do_it += 1
                 if allowed:
                     shown = result
                 else:
@@ -482,6 +515,20 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                     "is_error": is_error,
                 })
 
+        text = "\n".join(text_parts)
+        if acting and not edited and do_its < MAX_DO_IT and HANDS_OFF.search(text):
+            # « Corrigez la ligne 4 » : le modèle décrit au lieu de faire. Rappel (au plus MAX_DO_IT).
+            do_its += 1
+            described = described or text
+            ui.info("(le modèle a décrit l'action au lieu de la faire : minicode le relance)")
+            if response.stop_reason == "tool_use":
+                # Il a quand même appelé un outil (ex : lancer les tests sans rien corriger) :
+                # le rappel part avec les résultats, sans appel au modèle en plus.
+                tool_results.append({"type": "text", "text": DO_IT})
+            else:
+                messages.append({"role": "user", "content": DO_IT})
+                continue
+
         if response.stop_reason != "tool_use":
             if not text_parts and nudges < MAX_NUDGES:
                 # Réponse vide : on relance au lieu de laisser l'utilisateur sans rien.
@@ -490,9 +537,13 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                 messages.append({"role": "user", "content": NUDGE})
                 continue
             # Le modèle n'a plus besoin d'outils : la demande est terminée.
+            if described is not None and not tools_after_do_it and len(text) < 80:
+                # Relancé, il n'a rien fait et répond juste « OK » : c'était bien une simple
+                # explication. On garde sa première réponse, la plus utile.
+                return described
             if not text_parts:
                 ui.info("(le modèle n'a rien répondu)")
-            return "\n".join(text_parts) or "(le modèle n'a rien répondu)"
+            return text or "(le modèle n'a rien répondu)"
 
         # TOUS les résultats partent dans UN SEUL message "user".
         messages.append({"role": "user", "content": tool_results})
