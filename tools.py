@@ -32,7 +32,8 @@ MAX_OUTPUT_CHARS = 20_000
 MAX_GREP_MATCHES = 100
 MAX_EDIT_LINES = 15  # un old_string plus long = le modèle essaie de recopier tout le fichier
 BASH_TIMEOUT = 60  # secondes ; une commande bloquée ne doit pas figer l'agent
-IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "target", ".claude", ".minicode"}
+IGNORED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".tox",
+               "target", "dist", "build", ".next", ".gradle", ".claude", ".minicode"}
 # Dossier des réglages de minicode (règles de permission). L'agent ne doit pas
 # pouvoir y écrire, sinon il pourrait s'autoriser lui-même n'importe quoi.
 PROTECTED_DIR = ".minicode"
@@ -195,7 +196,7 @@ def _ready_made_edit(path: str, text: str, old: str, new: str) -> str:
 
     Les petits modèles n'arrivent pas à « changer d'approche » seuls (qwen3 a refait
     5 fois le même appel raté), mais ils recopient très bien ce qu'on leur montre.
-    On ne propose que ce qu'on a vérifié : trouvé une seule fois, et Python valide.
+    On ne propose que ce qu'on a vérifié : trouvé une seule fois, et fichier toujours valide.
     """
     hunk = _minimal_hunk(old, new)
     suggestion = hunk and _find_in_file(text, *hunk)
@@ -205,7 +206,7 @@ def _ready_made_edit(path: str, text: str, old: str, new: str) -> str:
     if text.count(old_s) != 1 or old_s == new_s:
         return ""
     try:
-        _check_python_still_valid(path, text, text.replace(old_s, new_s, 1))
+        _check_still_valid(path, text, text.replace(old_s, new_s, 1))
     except ToolError:
         return ""
     return ("\n[indice minicode : ta modification tient en quelques lignes. Appelle edit_file avec exactement "
@@ -252,36 +253,57 @@ def plan_edit(path: str, old_string: str, new_string: str) -> tuple[Path, str, s
     if count > 1:
         raise ToolError(f"old_string apparaît {count} fois : ajoute des lignes autour pour qu'il soit unique.")
     new_text = text.replace(old_string, new_string, 1)
-    _check_python_still_valid(path, text, new_text)
+    _check_still_valid(path, text, new_text)
     return p, new_text, f"Modifié : {path}"
 
 
-def _syntax_error(path: str, code: str) -> SyntaxError | None:
-    try:
-        compile(code, path, "exec")
-    except SyntaxError as e:
-        return e
+# Les formats dont minicode sait vérifier la syntaxe SANS rien installer (bibliothèque
+# standard de Python), avec un conseil adapté. Ajouter un langage = ajouter une ligne
+# (un vrai harness lancerait le compilateur ou le linter du projet).
+SYNTAX_HINTS = {
+    ".py": "Vérifie l'indentation de new_string (elle doit être la même que celle des lignes d'origine).",
+    ".json": "Vérifie les virgules (pas de virgule après le dernier élément), les guillemets doubles et les accolades.",
+}
+
+
+def _syntax_error(path: str, code: str):
+    """(numéro de ligne, type d'erreur, message) si `code` est invalide pour son format, sinon None.
+
+    Un format qu'on ne sait pas vérifier est considéré comme valide.
+    """
+    if path.endswith(".py"):
+        try:
+            compile(code, path, "exec")
+        except SyntaxError as e:
+            return e.lineno, type(e).__name__, e.msg
+    elif path.endswith(".json") and code.strip():
+        try:
+            json.loads(code)
+        except json.JSONDecodeError as e:
+            return e.lineno, "JSON invalide", e.msg
     return None
 
 
-def _check_python_still_valid(path: str, before: str, after: str) -> None:
-    """Refuse une modification qui CASSE un fichier Python qui était valide.
+def _check_still_valid(path: str, before: str, after: str) -> None:
+    """Refuse une modification qui CASSE un fichier (Python, JSON) qui était valide.
 
     Vu en vrai : qwen3 a « corrigé » un bug en perdant l'indentation d'une ligne ;
     le fichier ne se lançait plus (IndentationError) et il a annoncé « corrigé ».
     Les vrais harness lancent ce genre de vérification (compilateur, linter) après
     chaque modification et renvoient le résultat au modèle.
     """
-    if not path.endswith(".py") or _syntax_error(path, before):
-        return  # pas du Python, ou déjà cassé avant : on ne bloque pas une tentative de réparation
+    if _syntax_error(path, before):
+        return  # déjà cassé avant : on ne bloque pas une tentative de réparation
     error = _syntax_error(path, after)
     if error:
-        line = after.splitlines()[error.lineno - 1] if error.lineno and error.lineno <= len(after.splitlines()) else ""
+        lineno, kind, message = error
+        lines = after.splitlines()
+        line = lines[lineno - 1] if lineno and lineno <= len(lines) else ""
+        hint = next((h for ext, h in SYNTAX_HINTS.items() if path.endswith(ext)), "")
         raise ToolError(
-            f"Modification refusée : elle casserait {path} ({type(error).__name__} ligne {error.lineno} : "
-            f"{error.msg}).\n  ligne {error.lineno} après ta modification : {line!r}\n"
-            "Le fichier n'a pas été modifié. Vérifie l'indentation de new_string (elle doit être la même "
-            "que celle des lignes d'origine)."
+            f"Modification refusée : elle casserait {path} ({kind} ligne {lineno} : {message}).\n"
+            f"  ligne {lineno} après ta modification : {line!r}\n"
+            f"Le fichier n'a pas été modifié. {hint}"
         )
 
 
@@ -447,7 +469,7 @@ TOOL_SCHEMAS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Chemin relatif, ex: src/main.py"},
+                "path": {"type": "string", "description": "Chemin relatif à la racine du projet"},
                 "start_line": {"type": "integer", "description": "Optionnel : 1re ligne à lire (pour la suite d'un gros fichier)"},
             },
             "required": ["path"],
@@ -510,11 +532,10 @@ TOOL_SCHEMAS = [
     {
         "name": "interactive_start",
         "description": (
-            "Lance un programme interactif (qui pose des questions avec input()) et renvoie ce qu'il "
-            "affiche jusqu'à sa première question, avec un numéro de session. Ensuite, réponds-lui ligne "
-            "par ligne avec interactive_send, en lisant chaque réponse avant de choisir la suivante. "
-            "À utiliser quand les saisies dépendent de ce que le programme répond (ex : jeu avec indices "
-            "et nombre d'essais limité) ; sinon, bash avec stdin suffit."
+            "Lance un programme interactif (qui lit le clavier) et renvoie ce qu'il affiche jusqu'à sa "
+            "première question, avec un numéro de session. Ensuite, réponds-lui ligne par ligne avec "
+            "interactive_send, en lisant chaque réponse avant de choisir la suivante. À utiliser quand "
+            "les saisies dépendent de ce que le programme répond ; sinon, bash avec stdin suffit."
         ),
         "input_schema": {
             "type": "object",
@@ -546,23 +567,25 @@ TOOL_SCHEMAS = [
         "name": "bash",
         "description": (
             "Exécute une commande shell dans le dossier du projet et renvoie sa sortie et son code de "
-            f"sortie (0 = succès). Limite : {BASH_TIMEOUT} s. Utile pour lancer les tests (ex: uv run pytest) "
-            "et vérifier ton travail après une modification. Il n'y a pas de clavier. Programme qui pose "
-            "des questions (input()) : si tu connais toutes les réponses d'avance, donne-les dans stdin ; "
-            "si tes réponses dépendent de ce que le programme affiche (jeu à indices, essais limités...), "
-            "N'UTILISE PAS bash : utilise interactive_start puis interactive_send."
+            f"sortie (0 = succès). Limite : {BASH_TIMEOUT} s. Utile pour lancer les tests du projet et "
+            "vérifier ton travail après une modification. Il n'y a pas de clavier. Programme qui pose "
+            "des questions : si tu connais toutes les réponses d'avance, donne-les dans stdin ; si tes "
+            "réponses dépendent de ce que le programme affiche, N'UTILISE PAS bash : utilise "
+            "interactive_start puis interactive_send."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "La commande, ex: uv run pytest -q"},
-                # Pas d'exemple concret ici : les petits modèles RECOPIENT les exemples
-                # (ils envoyaient "50\n75\n62\n" à n'importe quel programme).
+                # Pas d'exemple concret dans ces deux descriptions : les petits modèles RECOPIENT
+                # les exemples. Vu avec stdin (ils envoyaient "50\n75\n62\n" à n'importe quel
+                # programme) puis aux évals (« ex: uv run pytest » → qwen3 lançait pytest même
+                # quand on lui donnait une autre commande, puis tentait de l'installer).
+                "command": {"type": "string", "description": "La commande shell à exécuter"},
                 "stdin": {
                     "type": "string",
                     "description": "Optionnel : texte envoyé au programme comme s'il était tapé au clavier, "
                                    "une ligne par saisie. Prévois une ligne pour CHAQUE question que posera "
-                                   "le programme, sinon il s'arrête avec EOFError.",
+                                   "le programme, sinon il s'arrête faute de saisie.",
                 },
             },
             "required": ["command"],

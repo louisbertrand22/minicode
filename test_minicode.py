@@ -876,5 +876,18 @@ def test_eval_workspaces_deny_sudo_even_in_yolo_mode(tmp_path, monkeypatch, caps
     assert "refusé par l'utilisateur" not in out
 
 
-def test_there_are_ten_distinct_tasks():
-    assert len(evals.TASKS) == 10 and len({t.name for t in evals.TASKS}) == 10
+def test_edit_that_breaks_json_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "config.json").write_text('{\n  "port": 8080,\n  "hote": "localhost"\n}\n')
+    result, is_error = tools.run_tool("edit_file", {"path": "config.json", "old_string": '"port": 8080,',
+                                                    "new_string": '"port": 9000,,'})
+    assert is_error and "JSON invalide" in result and "virgules" in result
+    assert "8080" in (tmp_path / "config.json").read_text()  # fichier intact
+    ok, is_error = tools.run_tool("edit_file", {"path": "config.json", "old_string": '"port": 8080,',
+                                                "new_string": '"port": 9000,'})
+    assert not is_error and "9000" in (tmp_path / "config.json").read_text()
+
+
+def test_eval_tasks_have_distinct_names_and_several_languages():
+    assert len({t.name for t in evals.TASKS}) == len(evals.TASKS) >= 10
+    assert any(f.endswith(".js") for t in evals.TASKS for f in t.files)  # pas seulement du Python

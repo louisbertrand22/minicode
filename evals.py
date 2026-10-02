@@ -4,7 +4,8 @@ Quand on change un prompt, un garde-fou ou un modèle, comment savoir si c'est M
 Essayer « à la main » sur un exemple ne suffit pas : un modèle est aléatoire, et une
 correction qui aide sur un cas peut en casser un autre. Une éval, c'est :
 
-  1. une liste de tâches FIXES (ici 10, petites) : des fichiers de départ + une demande ;
+  1. une liste de tâches FIXES (ici 13, petites, en Python, JavaScript, shell, JSON) :
+     des fichiers de départ + une demande ;
   2. pour chacune, une VÉRIFICATION automatique (le programme corrigé tourne, la réponse
      contient la bonne valeur…) : pas d'avis humain, pas de « ça a l'air bien » ;
   3. des mesures : réussite, nombre d'appels au modèle, tokens consommés, durée.
@@ -15,7 +16,7 @@ d'historique, MINICODE_YOLO=1 pour ne rien demander). La vérification se fait A
 depuis ce programme-ci, en regardant les fichiers et la réponse.
 
 Lancer :
-  uv run evals.py                    # les 10 tâches
+  uv run evals.py                    # toutes les tâches
   uv run evals.py -k bug -k jeu      # seulement celles dont le nom contient « bug » ou « jeu »
   uv run evals.py --repeat 3         # chaque tâche 3 fois (le modèle est aléatoire)
   MINICODE_MODEL=qwen3:4b uv run evals.py    # comparer un autre modèle
@@ -122,7 +123,71 @@ def check_ends_with_fin(workdir, answers):
     return last.endswith("FIN"), f"fin de la réponse : {last[-30:]!r}"
 
 
-TEST_CALC = "from calc import add, mul\n\nassert add(2, 3) == 5\nassert mul(2, 3) == 6\nprint('OK')\n"
+def check_js(workdir, answers):
+    if read(workdir, "test.js") != TEST_JS:
+        return False, "le test a été modifié (interdit)"
+    code, out = run(workdir, "node", "test.js")
+    return code == 0 and "OK" in out, f"node test.js → code {code}"
+
+
+def check_shell(workdir, answers):
+    if read(workdir, "test.sh") != TEST_SH:
+        return False, "le test a été modifié (interdit)"
+    code, out = run(workdir, "bash", "test.sh")
+    return code == 0, f"bash test.sh → {out.strip()[-60:]!r}"
+
+
+def check_json(workdir, answers):
+    try:
+        config = json.loads(read(workdir, "config.json"))
+    except json.JSONDecodeError as e:
+        return False, f"config.json n'est plus du JSON valide ({e.msg})"
+    ok = (config.get("serveur") == {"hote": "localhost", "port": 9000}
+          and config.get("journal") == {"niveau": "debug"})
+    return ok, f"serveur={config.get('serveur')} journal={config.get('journal')}"
+
+
+PANIER_JS = """function total(prix) {
+  let somme = 0;
+  for (let i = 1; i < prix.length; i++) {
+    somme += prix[i];
+  }
+  return somme;
+}
+
+module.exports = { total };
+"""
+TEST_JS = """const assert = require("assert");
+const { total } = require("./panier");
+
+assert.strictEqual(total([10, 20, 30]), 60);
+assert.strictEqual(total([]), 0);
+console.log("OK");
+"""
+COMPTER_SH = """#!/bin/bash
+# Affiche le nombre de fichiers .txt dans le dossier donné en argument.
+dossier="$1"
+ls "$dossier"/*.TXT 2>/dev/null | wc -l
+"""
+TEST_SH = """#!/bin/bash
+tmp=$(mktemp -d)
+touch "$tmp/a.txt" "$tmp/b.txt" "$tmp/c.md"
+resultat=$(bash compter.sh "$tmp")
+rm -rf "$tmp"
+if [ "$resultat" -eq 2 ]; then echo OK; else echo "ECHEC : attendu 2, obtenu $resultat"; exit 1; fi
+"""
+CONFIG_JSON = """{
+  "serveur": {
+    "hote": "localhost",
+    "port": 8080
+  },
+  "journal": {
+    "niveau": "info"
+  }
+}
+"""
+
+TEST_CALC ="from calc import add, mul\n\nassert add(2, 3) == 5\nassert mul(2, 3) == 6\nprint('OK')\n"
 GAME = '''import random
 
 secret = random.randint(1, 100)
@@ -186,6 +251,21 @@ TASKS = [
          ["Quelle est la valeur de VERSION dans data.py ?"],
          {"data.py": "".join(f"VALEUR_{i} = {i * 7}\n" for i in range(600)) + 'VERSION = "4.2.7"\n'},
          check_contains("4.2.7"), good_answer="VERSION vaut 4.2.7."),
+    # Autres langages : minicode doit être générique. La commande de test n'est PAS donnée :
+    # l'agent doit la trouver dans le projet (package.json, Makefile).
+    Task("corriger_js", "JavaScript (npm)",
+         ["Les tests du projet échouent. Trouve le bug et corrige-le."],
+         {"package.json": '{\n  "name": "panier",\n  "version": "1.0.0",\n  "scripts": {"test": "node test.js"}\n}\n',
+          "panier.js": PANIER_JS, "test.js": TEST_JS},
+         check_js, solution={"panier.js": PANIER_JS.replace("let i = 1", "let i = 0")}),
+    Task("corriger_shell", "shell + Makefile",
+         ["compter.sh affiche toujours 0. Corrige-le, puis vérifie avec les tests du projet."],
+         {"Makefile": "test:\n\tbash test.sh\n", "compter.sh": COMPTER_SH, "test.sh": TEST_SH},
+         check_shell, solution={"compter.sh": COMPTER_SH.replace("*.TXT", "*.txt")}),
+    Task("modifier_json", "JSON",
+         ["Dans config.json, passe le port du serveur à 9000 et le niveau du journal à debug."],
+         {"config.json": CONFIG_JSON}, check_json,
+         solution={"config.json": CONFIG_JSON.replace("8080", "9000").replace('"info"', '"debug"')}),
 ]
 
 

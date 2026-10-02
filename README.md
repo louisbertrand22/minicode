@@ -80,7 +80,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 7. Streaming (réflexion 💭 + réponse en direct, tokens par appel) + journal JSONL + `show_trace.py`
 - [x] 8. Gestion du contexte : compter les tokens, effacer les vieux résultats d'outils, résumer les vieux tours (`/context`, `/compact`)
 - [x] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte (lecture seule, seul le rapport revient)
-- [x] 10. Évals : 10 petites tâches, score de réussite / nombre d'appels / tokens / durée (`evals.py`)
+- [x] 10. Évals : 13 petites tâches (Python, JavaScript, shell, JSON), score de réussite / nombre d'appels / tokens / durée (`evals.py`)
 
 ## Étapes 4–5 : l'agent agit, le harness contrôle
 
@@ -197,6 +197,20 @@ Pourquoi dans le prompt système, et pas comme premier message ?
 - le modèle le traite comme une **consigne permanente**, pas comme une demande parmi d'autres ;
 - l'étape 8 ne le résume ni ne l'efface jamais : elle ne touche qu'à `messages` ;
 - il est identique d'un appel à l'autre, donc le serveur le garde **en cache**.
+
+**Prompt système ou AGENTS.md ?** Le prompt système de minicode ne contient que ce qui vaut
+pour **tous** les projets : explorer avant d'agir, vérifier, ne rien installer, ne pas tricher.
+Tout ce qui dépend d'un langage ou d'un projet va dans son `AGENTS.md`. Au début, le prompt
+contenait des consignes tirées de `jeu.py` (« lance avec python3 », « initialise le compteur
+avant la boucle »…). Elles étaient envoyées à chaque appel, même dans un projet JavaScript.
+Pour un projet Python comme `test_ai/`, elles iraient plutôt ici :
+
+```markdown
+# AGENTS.md (projet Python)
+- Lance les programmes avec `python3 fichier.py` ; il n'y a pas de tests automatiques.
+- Les jeux lisent le clavier avec input() : pour les tester, passe les réponses dans stdin.
+- Une variable qui doit garder sa valeur d'un tour de boucle à l'autre s'initialise AVANT la boucle.
+```
 
 La contrepartie : il est envoyé à **chaque** appel. minicode le limite donc à ~10 % de la
 fenêtre (≈ 2 400 caractères avec 8k tokens) et prévient s'il le coupe. Un bon AGENTS.md est court.
@@ -464,7 +478,7 @@ sur un cas peut en casser un autre. Une éval, c'est :
 3. des **mesures** : réussite, appels au modèle, tokens consommés (≈ coût), durée.
 
 ```bash
-uv run evals.py                         # les 10 tâches (~3 min avec qwen3:8b)
+uv run evals.py                         # toutes les tâches (~4 min avec qwen3:8b)
 uv run evals.py -k bug -k jeu           # seulement certaines
 uv run evals.py --repeat 3              # 3 essais par tâche : le modèle est aléatoire
 MINICODE_MODEL=qwen3:4b uv run evals.py # comparer un autre modèle
@@ -500,6 +514,35 @@ Ce que ça apprend, et qu'aucun essai à la main n'aurait montré aussi claireme
 - **la vérification par réflexe** (`pytest`) au lieu de la commande demandée ;
 - **la sécurité** : en mode YOLO, un agent qui bloque essaie d'installer des choses avec `sudo`.
   D'où les règles `deny` ajoutées après ce run.
+
+### Deuxième run : minicode rendu générique, 11/13
+
+Changements entre les deux runs (aucun ne vise une tâche précise) :
+- plus d'exemple `uv run pytest` dans la description de `bash` : les petits modèles **recopient
+  les exemples** ;
+- prompt système sans consignes tirées de `jeu.py`, et avec une règle générique : trouver la
+  commande de vérification (utilisateur → AGENTS.md → README/Makefile/package.json… → lancer le
+  programme), et ne rien installer ;
+- vérification de syntaxe de `edit_file` étendue au JSON ;
+- 3 tâches dans d'autres langages : JavaScript, shell + Makefile (la commande de test n'est
+  **pas** donnée), JSON.
+
+| tâche | 1er run | 2e run | |
+|---|---|---|---|
+| lire_valeur | ✗ | ✓ | |
+| corriger_bug | ✗ | ✓ | lance enfin `python3 test_calc.py` |
+| renommer | ✗ | ✓ | vérifie en lançant `main.py` |
+| gros_fichier | ✗ | ✓ | lit la suite avec `start_line` |
+| compteur_jeu | ✗ | ✗ | trouve le bug, décrit la correction… sans la faire |
+| corriger_js | – | ✓ | trouve `npm test` tout seul dans package.json |
+| corriger_shell | – | ✗ | même abandon : « Corrigez la ligne 4 » au lieu de le faire |
+| modifier_json | – | ✓ | |
+| les 5 autres | ✓ | ✓ | |
+
+Score : **11/13** (84 %) contre 5/10, pour 56 appels, ~196 000 tokens, 8,9 min. À prendre avec
+prudence : **un seul essai par tâche**, et qwen3 est aléatoire (`lire_valeur` n'a pas été
+touchée par ces changements, et passe pourtant cette fois). Les deux échecs restants ont la même
+cause, et ce n'est pas un problème de langage : le modèle **décrit** l'action au lieu de la **faire**.
 
 **Exercices** (la boucle « changer → mesurer → comparer » ; garde ce qui fait monter le score) :
 - Ajoute au prompt système : « Ne termine jamais en décrivant ce qu'il reste à faire : fais-le ».
