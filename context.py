@@ -82,8 +82,12 @@ class Budget:
     def __init__(self, window: int, system: str, tools: list):
         self.window = window
         self.limit = int(window * COMPACT_AT)
-        self.fixed = estimate_tokens(system) + estimate_tokens(tools)  # envoyés à chaque appel
+        self.set_fixed(system, tools)
         self.ratio = 1.0
+
+    def set_fixed(self, system: str, tools: list):
+        """Ce qui est envoyé à chaque appel (change si AGENTS.md change, étape 6)."""
+        self.fixed = estimate_tokens(system) + estimate_tokens(tools)
 
     def raw(self, messages) -> int:
         return self.fixed + estimate_tokens(messages)

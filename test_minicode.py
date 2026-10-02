@@ -4,11 +4,13 @@ C'est aussi une bonne façon de voir la "forme" exacte des échanges.
 """
 
 import json
+import os
 import re
 from types import SimpleNamespace as NS
 
 import anthropic
 
+import agents_md
 import context
 import minicode
 import permissions
@@ -693,3 +695,56 @@ def test_transcript_keeps_the_most_recent_part():
     messages += [{"role": "user", "content": f"demande {i} " + "x" * 50} for i in range(50)]
     out = context.transcript(messages, 500)
     assert len(out) <= 500 and "ancien résumé" in out and "demande 49" in out and "demande 0 " not in out
+
+
+# --- Étape 6 : contexte projet (AGENTS.md) ---------------------------------------------
+
+
+def test_agents_files_from_general_to_specific(tmp_path):
+    project = tmp_path / "projets" / "jeu"
+    project.mkdir(parents=True)
+    (tmp_path / "AGENTS.md").write_text("racine")             # au-dessus de `stop` : ignoré
+    (tmp_path / "projets" / "AGENTS.md").write_text("Réponds en français.")
+    (project / "AGENTS.md").write_text("Tests : python3 -m pytest")
+    found = agents_md.find_files(project, stop=tmp_path / "projets")
+    assert found == [tmp_path / "projets" / "AGENTS.md", project / "AGENTS.md"]  # le plus précis en dernier
+
+    text, files = agents_md.load(project, 10_000, stop=tmp_path / "projets")
+    assert files == found and "# Instructions du projet" in text
+    assert text.index("Réponds en français.") < text.index("Tests : python3 -m pytest")
+    assert "## AGENTS.md" in text  # chemin relatif au projet quand c'est possible
+
+
+def test_huge_agents_md_is_cut(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("x" * 5000)
+    text, _ = agents_md.load(tmp_path, 1000, stop=tmp_path)
+    assert "AGENTS.md tronqué" in text and 900 < text.count("x") <= 1000  # la limite compte aussi le titre
+    assert agents_md.load(tmp_path / "vide", 1000, stop=tmp_path)[0] != ""  # le parent s'applique aussi
+    (tmp_path / "AGENTS.md").write_text("  \n")
+    assert agents_md.load(tmp_path, 1000, stop=tmp_path)[0] == ""
+
+
+def test_agents_md_goes_into_system_prompt_and_reloads(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))  # on ne remonte pas au-dessus de tmp_path
+    monkeypatch.setattr(minicode, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(minicode, "_agents_fingerprint", None)
+    monkeypatch.setattr(minicode, "SYSTEM_PROMPT", minicode.BASE_SYSTEM_PROMPT)
+    monkeypatch.setattr(minicode, "BUDGET", context.Budget(8192, minicode.BASE_SYSTEM_PROMPT, tools.TOOL_SCHEMAS))
+
+    assert minicode.load_project_context() and minicode.SYSTEM_PROMPT == minicode.BASE_SYSTEM_PROMPT
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Lance les tests avec : uv run pytest")
+    fixed_before = minicode.BUDGET.fixed
+    assert minicode.load_project_context()                      # nouveau fichier : rechargé
+    assert minicode.BUDGET.fixed > fixed_before                 # étape 8 : la partie fixe a grossi
+    assert not minicode.load_project_context()                  # rien n'a changé : même prompt (cache)
+
+    client = FakeClient(NS(stop_reason="end_turn", content=[text("ok")]))
+    minicode.run_turn(client, [], "comment lancer les tests ?")
+    assert "uv run pytest" in client.requests[0]["system"]      # envoyé dans le prompt SYSTÈME
+    assert "uv run pytest" not in json.dumps(client.requests[0]["messages"])
+
+    agents.write_text("Lance les tests avec : make test")
+    os.utime(agents, ns=(1, 1))                                 # date de modification différente, à coup sûr
+    assert minicode.load_project_context()
+    assert "make test" in minicode.SYSTEM_PROMPT and "uv run pytest" not in minicode.SYSTEM_PROMPT

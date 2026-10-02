@@ -9,6 +9,8 @@
   4. Outils qui AGISSENT : grep, edit_file, bash (l'agent peut modifier et vérifier).
   5. Permissions   -> le harness demande avant edit_file et bash, sauf si une
                       règle de .minicode/permissions.json décide (voir permissions.py).
+  6. Contexte projet -> les AGENTS.md du projet sont ajoutés au prompt système
+                      (voir agents_md.py ; /init en fait écrire un par l'agent).
   7. Streaming + journal -> la réponse s'affiche au fil de l'eau, et chaque échange est
                       enregistré dans .minicode/traces/ (voir tracelog.py, show_trace.py).
   8. Contexte      -> avant chaque appel, on estime la taille de ce qu'on envoie ; si
@@ -34,6 +36,7 @@ import time
 
 import anthropic
 
+import agents_md
 import context
 import permissions
 import tools
@@ -56,7 +59,7 @@ CONTEXT_WINDOW = context.window_for(PROVIDER)  # MINICODE_CONTEXT_WINDOW pour la
 # Étape 8 : un seul résultat d'outil ne doit pas remplir la fenêtre à lui seul.
 tools.MAX_OUTPUT_CHARS = context.output_limit(CONTEXT_WINDOW)
 
-SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
+BASE_SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
 Tu travailles dans le projet situé à : {WORKSPACE}
 
 Méthode :
@@ -78,6 +81,13 @@ Méthode :
 - L'utilisateur peut refuser une action : dans ce cas, ne la retente pas, demande-lui comment procéder.
 
 Réponds de façon concise, en français. Tu peux utiliser du Markdown."""
+# Étape 6 : le prompt réellement envoyé = BASE_SYSTEM_PROMPT + les AGENTS.md du projet.
+# load_project_context() le (re)calcule ; avant ça, c'est juste la base.
+SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
+AGENTS_FILES = []
+_agents_fingerprint = None
+# AGENTS.md part à CHAQUE appel : au plus ~10 % de la fenêtre (≈ 2 400 caractères avec 8k).
+AGENTS_MAX_CHARS = max(2_000, min(20_000, int(CONTEXT_WINDOW * 0.10 * context.CHARS_PER_TOKEN)))
 
 REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui comment il veut procéder."
 # Les petits modèles finissent parfois leur tour avec seulement de la réflexion
@@ -89,6 +99,30 @@ BUDGET = context.Budget(CONTEXT_WINDOW, SYSTEM_PROMPT, TOOL_SCHEMAS)
 SUMMARY_SYSTEM = "Tu résumes des conversations de travail, fidèlement et brièvement."
 
 _ui = None
+
+
+def load_project_context(trace=None, ui=None) -> bool:
+    """ÉTAPE 6 : (re)lit les AGENTS.md et reconstruit le prompt système.
+
+    Appelé au démarrage puis avant chaque demande : si l'agent (ou toi) modifie
+    AGENTS.md pendant la session, la demande suivante en tient compte. Renvoie True
+    si le prompt a changé.
+    """
+    global SYSTEM_PROMPT, AGENTS_FILES, _agents_fingerprint
+    fingerprint = agents_md.fingerprint(WORKSPACE)
+    if fingerprint == _agents_fingerprint:
+        return False  # rien n'a changé : on garde le même prompt (et le cache du serveur)
+    first_time = _agents_fingerprint is None
+    _agents_fingerprint = fingerprint
+    extra, AGENTS_FILES = agents_md.load(WORKSPACE, AGENTS_MAX_CHARS)
+    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + extra
+    BUDGET.set_fixed(SYSTEM_PROMPT, TOOL_SCHEMAS)  # étape 8 : la partie fixe a changé de taille
+    if trace and not first_time:
+        trace.log_system(SYSTEM_PROMPT)
+    if ui and not first_time:
+        names = ", ".join(str(p) for p in AGENTS_FILES) or "aucun"
+        ui.info(f"AGENTS.md rechargé ({names}) : le prompt système a changé.")
+    return True
 
 
 def get_ui():
@@ -404,11 +438,12 @@ def main():
     client = make_client()
     messages = []  # TOUT l'état de la conversation tient dans cette liste
     trace = None
+    load_project_context()  # étape 6 : AVANT le journal, qui enregistre le prompt système
     if TRACE:
         trace = Trace(WORKSPACE / PROTECTED_DIR / "traces",
                       provider=PROVIDER, model=MODEL, system=SYSTEM_PROMPT, tools=TOOL_SCHEMAS)
     ui = get_ui()
-    ui.welcome(WORKSPACE, trace.path if trace else None)
+    ui.welcome(WORKSPACE, trace.path if trace else None, AGENTS_FILES)
 
     while True:
         user_input = ui.read_input()
@@ -443,6 +478,13 @@ def main():
         if user_input == "/trace":
             ui.info(f"journal : {trace.path}" if trace else "journal désactivé (MINICODE_TRACE=0)")
             continue
+        load_project_context(trace, ui)  # AGENTS.md a pu changer depuis la dernière demande
+        if user_input == "/agents":
+            ui.agents_report(AGENTS_FILES, len(SYSTEM_PROMPT) - len(BASE_SYSTEM_PROMPT), AGENTS_MAX_CHARS)
+            continue
+        if user_input == "/init":
+            # Pas de magie : /init est une demande toute prête, traitée comme les autres.
+            user_input = agents_md.INIT_REQUEST
 
         # Copie de la liste pour pouvoir annuler la demande : un simple indice ne suffit
         # plus, car l'étape 8 peut résumer le DÉBUT de l'historique pendant la demande.

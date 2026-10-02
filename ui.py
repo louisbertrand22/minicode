@@ -36,6 +36,8 @@ TOOL_LABELS = {"read_file": "Read", "list_dir": "List", "grep": "Search", "edit_
 SLASH_COMMANDS = {
     "/help": "afficher cette aide",
     "/clear": "nouvelle conversation (vide l'historique envoyé au modèle)",
+    "/init": "faire écrire un AGENTS.md (instructions du projet) par l'agent",
+    "/agents": "les AGENTS.md chargés dans le prompt système",
     "/context": "ce qui occupe la fenêtre de contexte",
     "/compact": "résumer la conversation pour libérer du contexte",
     "/trace": "chemin du journal de la session",
@@ -174,13 +176,17 @@ class TerminalUI:
 
     # --- accueil et saisie -------------------------------------------------------
 
-    def welcome(self, workspace, trace_path=None):
+    def welcome(self, workspace, trace_path=None, agents_files=()):
         body = Text.assemble(("✻ ", ACCENT), ("Bienvenue dans ", ""), ("minicode", "bold"), (" !\n\n", ""),
                              ("  /help pour l'aide, /clear pour une nouvelle conversation\n\n", "dim"),
                              (f"  dossier : {workspace}\n", "dim"),
                              (f"  modèle  : {self.provider} / {self.model}", "dim"))
         if trace_path:
             body.append(f"\n  journal : {trace_path}", style="dim")
+        if agents_files:
+            body.append(f"\n  projet  : {', '.join(str(p) for p in agents_files)}", style="dim")
+        else:
+            body.append("\n  projet  : pas d'AGENTS.md (/init pour en créer un)", style="dim")
         self.console.print(Panel(body, border_style=ACCENT, expand=False))
         self.console.print()
 
@@ -243,7 +249,15 @@ class TerminalUI:
     def reset(self):
         self.context_tokens = self.cached_tokens = self.calls = 0
 
-    # --- contexte (étape 8) ----------------------------------------------------------
+    # --- contexte projet (étape 6) et fenêtre de contexte (étape 8) ------------------
+
+    def agents_report(self, files, added_chars, max_chars):
+        if not files:
+            self.info("Aucun AGENTS.md trouvé (ni ici, ni dans les dossiers parents). /init pour en créer un.")
+            return
+        for path in files:
+            self.info(f"• {path}")
+        self.info(f"{added_chars} caractères ajoutés au prompt système, à chaque appel (limite {max_chars}).")
 
     def context_freed(self, what, before, after):
         self.console.print(Text(f"✻ Contexte allégé : {what} (~{before} → ~{after} tokens)", style=ACCENT))

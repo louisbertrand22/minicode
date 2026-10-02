@@ -76,7 +76,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 3. Boucle d'agent (plusieurs appels d'outils, en parallèle, limite `MAX_STEPS`)
 - [x] 4. Outils qui agissent : `grep`, `edit_file` (remplacement exact), `bash` (+ relance si réponse vide)
 - [x] 5. Permissions : o/t/N avant `bash` et `edit_file`, règles allow/deny dans `.minicode/permissions.json`
-- [ ] 6. Contexte projet : charger un `AGENTS.md` dans le prompt système
+- [x] 6. Contexte projet : les `AGENTS.md` du projet (et des dossiers parents) dans le prompt système, `/init`, `/agents`
 - [x] 7. Streaming (réflexion 💭 + réponse en direct, tokens par appel) + journal JSONL + `show_trace.py`
 - [x] 8. Gestion du contexte : compter les tokens, effacer les vieux résultats d'outils, résumer les vieux tours (`/context`, `/compact`)
 - [ ] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte
@@ -169,6 +169,44 @@ Deux protections ajoutées en testant l'interface avec qwen3:8b :
   façon (texte introuvable, fichier existant…) renvoie l'erreur au modèle sans te déranger ;
 - **détecter les boucles** : qwen3 a refait 6 fois exactement le même appel raté. Le harness
   signale maintenant « tu as déjà fait exactement cet appel et il a échoué ».
+
+## Étape 6 : le contexte projet (`AGENTS.md`)
+
+Au début d'une conversation, le modèle ne sait rien de ton projet : ni comment lancer les
+tests, ni tes conventions, ni ce qu'il ne doit pas toucher. `AGENTS.md` est un simple fichier
+Markdown **écrit pour les agents** (comme un README pour les humains). Le même format est lu
+par plusieurs outils ; Claude Code utilise le même principe avec `CLAUDE.md`.
+
+```markdown
+# AGENTS.md
+- Tests : `uv run pytest` (à lancer après chaque modification)
+- Code et messages en français.
+- Ne touche jamais à `uv.lock`.
+```
+
+minicode cherche `AGENTS.md` dans le dossier du projet **et dans ses parents**, jusqu'à ton
+dossier personnel. Un `~/projets/AGENTS.md` s'applique donc à tous tes projets. Il les ajoute
+à la fin du **prompt système**, du plus général au plus précis (→ `agents_md.py`).
+
+Pourquoi dans le prompt système, et pas comme premier message ?
+- le modèle le traite comme une **consigne permanente**, pas comme une demande parmi d'autres ;
+- l'étape 8 ne le résume ni ne l'efface jamais : elle ne touche qu'à `messages` ;
+- il est identique d'un appel à l'autre, donc le serveur le garde **en cache**.
+
+La contrepartie : il est envoyé à **chaque** appel. minicode le limite donc à ~10 % de la
+fenêtre (≈ 2 400 caractères avec 8k tokens) et prévient s'il le coupe. Un bon AGENTS.md est court.
+
+- `/init` : l'agent explore le projet et écrit (ou améliore) `AGENTS.md`. Il n'y a rien de
+  magique : c'est juste une demande toute prête (`agents_md.INIT_REQUEST`).
+- `/agents` : les fichiers chargés, et combien de caractères ils ajoutent au prompt.
+- Avant chaque demande, minicode vérifie si un `AGENTS.md` a changé (date de modification).
+  Si oui, il reconstruit le prompt système et le note dans le journal (`"type": "system"`).
+  Sinon il ne touche à rien, pour garder le cache.
+
+**Exercices :**
+- Écris une règle visible (« termine chaque réponse par 🦊 ») et regarde si qwen3 la suit.
+- `uv run show_trace.py --call 1` : retrouve ton AGENTS.md dans le `system` envoyé.
+- Mets une règle dans `~/AGENTS.md` et une règle contraire dans le projet : laquelle gagne ?
 
 ## Étape 7 : voir ce qui se passe sous le capot
 

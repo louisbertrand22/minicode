@@ -59,10 +59,17 @@ def main():
     records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     session = next(r for r in records if r["type"] == "session")
     calls = [r for r in records if r["type"] == "call"]
+    # Étape 6 : le prompt système change si AGENTS.md est modifié pendant la session.
+    system_at, system = [], session["system"]
+    for record in records:
+        if record["type"] == "system":
+            system = record["system"]
+        elif record["type"] == "call":
+            system_at.append(system)
 
     if args.call:
         call = calls[args.call - 1]
-        print(json.dumps({"system": session["system"], "tools": session["tools"],
+        print(json.dumps({"system": system_at[args.call - 1], "tools": session["tools"],
                           "messages": call["request_messages"]}, ensure_ascii=False, indent=2))
         return
 
