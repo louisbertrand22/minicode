@@ -32,7 +32,7 @@ import tools
 
 ACCENT = "#D97757"  # l'orange de Claude
 TOOL_LABELS = {"read_file": "Read", "list_dir": "List", "grep": "Search", "edit_file": "Update", "bash": "Bash",
-               "interactive_start": "Run", "interactive_send": "Type"}
+               "interactive_start": "Run", "interactive_send": "Type", "task": "Task"}
 SLASH_COMMANDS = {
     "/help": "afficher cette aide",
     "/clear": "nouvelle conversation (vide l'historique envoyé au modèle)",
@@ -233,10 +233,12 @@ class TerminalUI:
     def model_call(self):
         return StreamView(self)
 
-    def record_usage(self, usage):
+    def record_usage(self, usage, update_context=True):
         if usage is None:
             return
         self.calls += 1
+        if not update_context:  # appel d'un sous-agent : la barre garde le contexte principal
+            return
         self.cached_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
         self.context_tokens = (usage.input_tokens + self.cached_tokens
                                + (getattr(usage, "cache_creation_input_tokens", 0) or 0))
@@ -293,6 +295,8 @@ class TerminalUI:
             arg = f"{tool_input.get('text', '')} → session {tool_input.get('session_id', '?')}"
         elif name == "grep":
             arg = f"\"{tool_input.get('pattern', '')}\" dans {tool_input.get('path', '.')}"
+        elif name == "task":
+            arg = tool_input.get("description") or tool_input.get("prompt", "").split("\n")[0]
         else:
             arg = tool_input.get("path", "")
         return arg if len(arg) <= 80 else arg[:79] + "…"
@@ -346,9 +350,24 @@ class TerminalUI:
             summary = Group(Text(f"{tool_input['path']} : +{added} −{removed} lignes"), render_diff(diff_rows or []))
         elif name in ("bash", "interactive_start", "interactive_send"):
             summary = self._output_summary(lines)
+        elif name == "task":
+            summary = Text(f"rapport du sous-agent : {len(lines)} lignes (seul ce rapport entre dans le contexte)")
         else:
             summary = Text(lines[0] if lines else "")
         self.console.print(_result_line(summary))
+
+    # --- sous-agents (étape 9) ------------------------------------------------------
+
+    def subagent_start(self, description):
+        self.console.print(Text(f"  ⎿  sous-agent : {description or 'recherche'} (historique vide, lecture seule)",
+                                style="dim"))
+
+    def subagent_step(self, name, tool_input, is_error):
+        line = f"     ↳ {self._label(name, tool_input)}({self._argument(name, tool_input)})"
+        self.console.print(Text(line + ("  ✗" if is_error else ""), style="red" if is_error else "dim"))
+
+    def subagent_done(self, calls):
+        self.console.print(Text(f"     ✓ terminé en {calls} appel(s) au modèle", style="dim"))
 
     # --- permissions ---------------------------------------------------------------
 

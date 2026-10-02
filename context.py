@@ -71,6 +71,12 @@ def estimate_tokens(obj) -> int:
     return int(len(json.dumps(to_jsonable(obj), ensure_ascii=False, default=str)) / CHARS_PER_TOKEN)
 
 
+def real_tokens(usage) -> int:
+    """Le VRAI nombre de tokens lus par le modèle (la partie en cache compte aussi)."""
+    return (usage.input_tokens + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+            + (getattr(usage, "cache_creation_input_tokens", 0) or 0))
+
+
 class Budget:
     """Combien de tokens on enverrait au prochain appel, et le seuil à ne pas dépasser.
 

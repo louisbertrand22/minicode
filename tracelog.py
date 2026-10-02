@@ -42,9 +42,12 @@ class Trace:
             # default=str : un journal ne doit jamais faire planter l'agent
             f.write(json.dumps(to_jsonable(record), ensure_ascii=False, default=str) + "\n")
 
-    def log_call(self, messages, response, seconds):
+    def log_call(self, messages, response, seconds, agent=None, system=None):
+        """`agent` : None pour l'agent principal, "sous-agent" pour l'étape 9 (avec son prompt)."""
         usage = getattr(response, "usage", None)
+        extra = {"agent": agent, "system": system} if agent else {}
         self._write({
+            **extra,
             "type": "call",
             "ts": time.time(),
             "seconds": round(seconds, 2),

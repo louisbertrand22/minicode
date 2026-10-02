@@ -69,7 +69,8 @@ def main():
 
     if args.call:
         call = calls[args.call - 1]
-        print(json.dumps({"system": system_at[args.call - 1], "tools": session["tools"],
+        # Un sous-agent (étape 9) a son propre prompt, enregistré avec l'appel.
+        print(json.dumps({"system": call.get("system") or system_at[args.call - 1], "tools": session["tools"],
                           "messages": call["request_messages"]}, ensure_ascii=False, indent=2))
         return
 
@@ -78,13 +79,17 @@ def main():
     print(f"{DIM}prompt système : {len(session['system'])} caractères, {len(session['tools'])} outils "
           f"(envoyés à CHAQUE appel ; voir --call N){RESET}\n")
 
-    seen = 0
+    # Chaque agent a SA conversation (étape 9) : on suit ce qui est nouveau pour chacun.
+    seen_by_agent = {}
     for i, call in enumerate(calls, 1):
         sent = call["request_messages"]
+        agent = call.get("agent")
+        seen = seen_by_agent.get(agent, 0)
         usage = call.get("usage") or {}
         cached = usage.get("cache_read_input_tokens") or 0
         total = (usage.get("input_tokens") or 0) + cached + (usage.get("cache_creation_input_tokens") or 0)
-        print(f"{BOLD}── appel {i}{RESET}  {len(sent)} messages envoyés · "
+        who = f" ({agent})" if agent else ""
+        print(f"{BOLD}── appel {i}{who}{RESET}  {len(sent)} messages envoyés · "
               f"{total} tokens (dont {cached} en cache) → {usage.get('output_tokens', '?')} tokens · "
               f"{call['seconds']} s · stop={call['stop_reason']}")
         if len(sent) < seen:
@@ -96,7 +101,7 @@ def main():
         for block in call["response_content"]:
             print(f"   ← modèle    {describe_block(block)}")
         # au prochain appel, la réponse du modèle fera partie de l'historique envoyé
-        seen = len(sent) + 1
+        seen_by_agent[agent] = len(sent) + 1
         print()
 
 

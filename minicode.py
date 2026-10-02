@@ -16,6 +16,8 @@
   8. Contexte      -> avant chaque appel, on estime la taille de ce qu'on envoie ; si
                       la fenêtre du modèle va déborder, on efface les vieux résultats
                       d'outils, puis on résume les anciens tours (voir context.py).
+  9. Sous-agents   -> l'outil `task` lance une 2e boucle d'agent, avec un historique
+                      vide et des outils de lecture ; seul son rapport revient (subagent.py).
 
 Tout l'affichage (façon Claude Code) est dans ui.py : ce fichier-ci ne contient
 que le harness, et appelle `ui.xxx()` pour montrer ce qui se passe.
@@ -39,6 +41,7 @@ import anthropic
 import agents_md
 import context
 import permissions
+import subagent
 import tools
 from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, precheck, run_tool, stop_all_sessions
 from tracelog import Trace
@@ -64,6 +67,9 @@ Tu travailles dans le projet situé à : {WORKSPACE}
 
 Méthode :
 - Explore avant de répondre : grep pour trouver où est quelque chose, read_file pour le lire. Ne devine jamais le contenu d'un fichier.
+- Pour une recherche qui demande de parcourir PLUSIEURS fichiers (« où est géré X ? », « comment marche Y ? »),
+  délègue-la à task : un sous-agent cherche et te renvoie un court rapport, ton contexte reste petit.
+  Pour lire UN fichier dont tu connais le nom, utilise directement read_file.
 - Avant de modifier un fichier avec edit_file, lis-le. Fais des modifications petites et ciblées.
 - Après une modification, vérifie ton travail avec bash (par exemple en lançant les tests).
 - Pour tester un programme interactif (input()) : lis-le d'abord avec read_file pour savoir quelles
@@ -95,7 +101,11 @@ REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui
 NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
 MAX_NUDGES = 1
 MAX_SAME_FAILURES = 3  # au 3e appel identique raté, on arrête la demande
-BUDGET = context.Budget(CONTEXT_WINDOW, SYSTEM_PROMPT, TOOL_SCHEMAS)
+# Étape 9 : l'agent principal a en plus l'outil `task` ; un sous-agent n'a que la lecture.
+MAIN_TOOLS = TOOL_SCHEMAS + [subagent.TASK_SCHEMA]
+SUB_TOOLS = [t for t in TOOL_SCHEMAS if t["name"] in subagent.READ_ONLY_TOOLS]
+PROJECT_CONTEXT = ""  # le texte des AGENTS.md (étape 6), donné aussi aux sous-agents
+BUDGET = context.Budget(CONTEXT_WINDOW, SYSTEM_PROMPT, MAIN_TOOLS)
 SUMMARY_SYSTEM = "Tu résumes des conversations de travail, fidèlement et brièvement."
 
 _ui = None
@@ -108,15 +118,15 @@ def load_project_context(trace=None, ui=None) -> bool:
     AGENTS.md pendant la session, la demande suivante en tient compte. Renvoie True
     si le prompt a changé.
     """
-    global SYSTEM_PROMPT, AGENTS_FILES, _agents_fingerprint
+    global SYSTEM_PROMPT, AGENTS_FILES, PROJECT_CONTEXT, _agents_fingerprint
     fingerprint = agents_md.fingerprint(WORKSPACE)
     if fingerprint == _agents_fingerprint:
         return False  # rien n'a changé : on garde le même prompt (et le cache du serveur)
     first_time = _agents_fingerprint is None
     _agents_fingerprint = fingerprint
-    extra, AGENTS_FILES = agents_md.load(WORKSPACE, AGENTS_MAX_CHARS)
-    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + extra
-    BUDGET.set_fixed(SYSTEM_PROMPT, TOOL_SCHEMAS)  # étape 8 : la partie fixe a changé de taille
+    PROJECT_CONTEXT, AGENTS_FILES = agents_md.load(WORKSPACE, AGENTS_MAX_CHARS)
+    SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + PROJECT_CONTEXT
+    BUDGET.set_fixed(SYSTEM_PROMPT, MAIN_TOOLS)  # étape 8 : la partie fixe a changé de taille
     if trace and not first_time:
         trace.log_system(SYSTEM_PROMPT)
     if ui and not first_time:
@@ -147,19 +157,24 @@ def make_client():
     return anthropic.Anthropic()  # lit ANTHROPIC_API_KEY dans l'environnement
 
 
-def request_params(messages):
-    """Exactement ce qu'on envoie au modèle (hors en-têtes HTTP)."""
-    params = dict(model=MODEL, system=SYSTEM_PROMPT, messages=messages)
+def request_params(messages, system=None, tool_schemas=None):
+    """Exactement ce qu'on envoie au modèle (hors en-têtes HTTP).
+
+    Par défaut : l'agent principal. Un sous-agent (étape 9) passe son prompt et ses outils.
+    """
+    system = SYSTEM_PROMPT if system is None else system
+    tool_schemas = MAIN_TOOLS if tool_schemas is None else tool_schemas
+    params = dict(model=MODEL, system=system, messages=messages)
     if PROVIDER == "ollama":
         # Ollama ne connaît que l'API de base (pas les options bêta ci-dessous).
-        return {**params, "max_tokens": 16000, "tools": TOOL_SCHEMAS}
+        return {**params, "max_tokens": 16000, "tools": tool_schemas}
     return {
         **params,
         "max_tokens": 64000,  # en streaming, pas de risque de timeout : on laisse de la marge
         # eager_input_streaming : les arguments d'un outil (ex : tout un fichier pour
         # edit_file) arrivent au fil de l'eau. Contrepartie : l'API ne les valide plus,
         # c'est run_tool() qui vérifie qu'ils sont complets.
-        "tools": [{**t, "eager_input_streaming": True} for t in TOOL_SCHEMAS],
+        "tools": [{**t, "eager_input_streaming": True} for t in tool_schemas],
         "thinking": {"type": "adaptive", "display": "summarized"},  # sinon la réflexion arrive vide
         "output_config": {"effort": EFFORT},
         # Si un filtre de sécurité refuse la requête, l'API la rejoue sur un
@@ -169,34 +184,40 @@ def request_params(messages):
     }
 
 
-def call_model(client, messages, trace=None, ui=None):
+def call_model(client, messages, trace=None, ui=None, system=None, tool_schemas=None, budget=None, agent=None):
     """UN appel au modèle, en STREAMING (étape 7).
 
     Au lieu d'attendre la réponse complète, on reçoit des petits événements
     ("thinking", "text"...) qu'on passe à l'interface dès qu'ils arrivent. À la
     fin, le SDK reconstitue le message complet (get_final_message), identique à
     ce que renverrait un appel normal : le reste de la boucle ne change pas.
+
+    `agent` : None pour l'agent principal, "sous-agent" pour l'étape 9. Le texte d'un
+    sous-agent n'est pas affiché : c'est un rapport pour l'agent principal, pas pour toi.
     """
     ui = ui or get_ui()
+    budget = budget or BUDGET
     api = client.messages if PROVIDER == "ollama" else client.beta.messages
     start = time.time()
-    with ui.model_call() as view, api.stream(**request_params(messages)) as stream:
+    with ui.model_call() as view, api.stream(**request_params(messages, system, tool_schemas)) as stream:
         for event in stream:
             if event.type == "thinking":
                 view.on_thinking(event.thinking)
-            elif event.type == "text":
+            elif event.type == "text" and agent is None:
                 view.on_text(event.text)
         response = stream.get_final_message()
     seconds = time.time() - start
     # Le total grossit à chaque appel (tout l'historique), mais le serveur garde en
     # CACHE le début déjà vu : `input_tokens` ne compte que la partie nouvelle.
     usage = getattr(response, "usage", None)
-    ui.record_usage(usage)
+    # La barre du bas montre le contexte de l'agent PRINCIPAL ; un sous-agent compte
+    # seulement comme un appel de plus.
+    ui.record_usage(usage, update_context=agent is None)
     if usage is not None:
         # Étape 8 : le VRAI nombre de tokens corrige nos estimations suivantes.
-        BUDGET.calibrate(messages, ui.context_tokens)
+        budget.calibrate(messages, context.real_tokens(usage))
     if trace:
-        trace.log_call(messages, response, seconds)
+        trace.log_call(messages, response, seconds, agent=agent, system=system)
     return response
 
 
@@ -223,7 +244,7 @@ def summarize(client, old_messages, trace=None, ui=None):
         ui.warn(f"(résumé impossible : {e} ; minicode garde juste la liste des demandes)")
         return context.fallback_summary(old_messages)
     if trace:
-        trace.log_call(request, response, time.time() - start)
+        trace.log_call(request, response, time.time() - start, agent="résumé", system=SUMMARY_SYSTEM)
     summary = "".join(b.text for b in response.content if b.type == "text").strip()
     return summary or context.fallback_summary(old_messages)
 
@@ -241,35 +262,79 @@ def compact(client, messages, end, trace=None, ui=None):
     return 2
 
 
-def fit_context(client, messages, turn_start, trace=None, ui=None):
+def fit_context(client, messages, turn_start, trace=None, ui=None, budget=None):
     """ÉTAPE 8 : appelé AVANT chaque appel au modèle. Fait de la place si besoin.
 
     Du moins cher au plus cher. Renvoie le nouvel indice de début de la demande en
     cours (il change si les tours précédents sont résumés).
     """
     ui = ui or get_ui()
-    if not BUDGET.over(messages):
+    budget = budget or BUDGET  # un sous-agent a son propre budget (étape 9)
+    if not budget.over(messages):
         return turn_start
     # 1. Gratuit : les vieux résultats d'outils ont déjà servi.
-    before = BUDGET.estimate(messages)
+    before = budget.estimate(messages)
     cleared = context.clear_old_tool_results(messages)
     if cleared:
-        after = BUDGET.estimate(messages)
+        after = budget.estimate(messages)
         ui.context_freed(f"{cleared} ancien(s) résultat(s) d'outil effacé(s)", before, after)
         if trace:
             trace.log_compact("clear_tool_results", before, after)
     # 2. Un appel au modèle : résumer les tours PRÉCÉDENTS. La demande en cours reste
     #    intacte : on ne coupe jamais entre un tool_use et son tool_result.
-    if BUDGET.over(messages) and turn_start > 0 and not context.is_summary(messages[:turn_start]):
+    if budget.over(messages) and turn_start > 0 and not context.is_summary(messages[:turn_start]):
         turn_start = compact(client, messages, turn_start, trace, ui)
     # 3. Dernier recours : la demande en cours est énorme à elle seule.
-    before = BUDGET.estimate(messages)
-    if BUDGET.over(messages) and context.clear_old_tool_results(messages, keep=1):
-        ui.context_freed("seul le dernier résultat d'outil est gardé", before, BUDGET.estimate(messages))
-    if BUDGET.over(messages):
-        ui.warn(f"(contexte toujours trop grand : ~{BUDGET.estimate(messages)}/{CONTEXT_WINDOW} tokens. "
+    before = budget.estimate(messages)
+    if budget.over(messages) and context.clear_old_tool_results(messages, keep=1):
+        ui.context_freed("seul le dernier résultat d'outil est gardé", before, budget.estimate(messages))
+    if budget.over(messages):
+        ui.warn(f"(contexte toujours trop grand : ~{budget.estimate(messages)}/{CONTEXT_WINDOW} tokens. "
                 "Le modèle risque d'oublier le début ; fais /clear si ses réponses se dégradent.)")
     return turn_start
+
+
+def run_subagent(client, tool_input, trace=None, ui=None):
+    """ÉTAPE 9 : l'outil `task`. Une 2e boucle d'agent, avec son PROPRE historique.
+
+    C'est la même boucle que _agent_loop, en plus simple : un historique qui commence
+    vide (juste la consigne), des outils de lecture (pas de permission à demander), un
+    nombre d'étapes limité. Renvoie (rapport, is_error) : le rapport devient le
+    tool_result de `task` chez l'agent principal ; tout le reste est oublié.
+    """
+    ui = ui or get_ui()
+    system = subagent.SYSTEM_PROMPT.format(workspace=WORKSPACE) + PROJECT_CONTEXT
+    budget = context.Budget(CONTEXT_WINDOW, system, SUB_TOOLS)
+    messages = [{"role": "user", "content": tool_input["prompt"]}]  # PAS l'historique principal
+    ui.subagent_start(tool_input.get("description", ""))
+    for step in range(subagent.MAX_STEPS + 1):
+        fit_context(client, messages, 0, trace, ui, budget)  # étape 8, aussi pour lui
+        try:
+            response = call_model(client, messages, trace, ui, system, SUB_TOOLS, budget, agent="sous-agent")
+        except ValueError:
+            return "Le sous-agent a produit un appel d'outil illisible. Relance task ou cherche toi-même.", True
+        text = "\n".join(b.text for b in response.content if b.type == "text" and b.text.strip())
+        if response.stop_reason != "tool_use":
+            ui.subagent_done(step + 1)
+            return text or "(le sous-agent n'a rien répondu)", not text
+        if step == subagent.MAX_STEPS:
+            ui.subagent_done(step + 1)
+            note = f"[sous-agent arrêté : {subagent.MAX_STEPS} étapes sans rapport final]"
+            return (text + "\n" + note) if text else note, not text
+        messages.append({"role": "assistant", "content": response.content})
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name in subagent.READ_ONLY_TOOLS:
+                result, is_error = run_tool(block.name, block.input)
+            else:  # le modèle peut demander un outil qu'il n'a pas : on refuse proprement
+                result, is_error = f"{block.name} n'est pas disponible pour un sous-agent (lecture seule).", True
+            ui.subagent_step(block.name, block.input, is_error)
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": result, "is_error": is_error})
+        if step == subagent.MAX_STEPS - 1:
+            results.append({"type": "text", "text": subagent.FINISH_NOW})  # dernier appel : le rapport
+        messages.append({"role": "user", "content": results})
 
 
 def ask_permission(name, tool_input, ui=None):
@@ -362,7 +427,10 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                 ui.tool_call(block.name, block.input)
                 diff = _diff_before_edit(block.name, block.input)
                 allowed, feedback = True, None
-                problem = precheck(block.name, block.input)
+                if block.name == "task":
+                    problem = subagent.validate(block.input)
+                else:
+                    problem = precheck(block.name, block.input)
                 if problem:
                     # L'appel va échouer : inutile de demander la permission.
                     result, is_error = problem, True
@@ -370,7 +438,11 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                     if block.name in DANGEROUS_TOOLS:
                         answer = confirm(block.name, block.input)
                         allowed, feedback = answer if isinstance(answer, tuple) else (answer, None)
-                    if allowed:
+                    if allowed and block.name == "task":
+                        # Étape 9 : pas d'outil Python ici, mais une boucle d'agent entière.
+                        result, is_error = run_subagent(client, block.input, trace, ui)
+                        result = tools._truncate(result)
+                    elif allowed:
                         result, is_error = run_tool(block.name, block.input)
                     else:
                         # Refus : on ne l'exécute pas, mais on DOIT quand même renvoyer
@@ -441,7 +513,7 @@ def main():
     load_project_context()  # étape 6 : AVANT le journal, qui enregistre le prompt système
     if TRACE:
         trace = Trace(WORKSPACE / PROTECTED_DIR / "traces",
-                      provider=PROVIDER, model=MODEL, system=SYSTEM_PROMPT, tools=TOOL_SCHEMAS)
+                      provider=PROVIDER, model=MODEL, system=SYSTEM_PROMPT, tools=MAIN_TOOLS)
     ui = get_ui()
     ui.welcome(WORKSPACE, trace.path if trace else None, AGENTS_FILES)
 

@@ -14,6 +14,7 @@ import agents_md
 import context
 import minicode
 import permissions
+import subagent
 import tools
 from tracelog import Trace
 from ui import TerminalUI, edit_diff
@@ -748,3 +749,82 @@ def test_agents_md_goes_into_system_prompt_and_reloads(tmp_path, monkeypatch):
     os.utime(agents, ns=(1, 1))                                 # date de modification différente, à coup sûr
     assert minicode.load_project_context()
     assert "make test" in minicode.SYSTEM_PROMPT and "uv run pytest" not in minicode.SYSTEM_PROMPT
+
+
+# --- Étape 9 : sous-agents (outil task) --------------------------------------------------
+
+
+def task_call(id="k1", prompt="Trouve où est définie la fonction add."):
+    return tool_use(id, "task", description="Trouver add", prompt=prompt)
+
+
+def test_subagent_has_its_own_history_and_only_its_report_comes_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b  # SECRET_DU_FICHIER\n")
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[text("Je délègue."), task_call()]),                # principal
+        NS(stop_reason="tool_use", content=[tool_use("s1", "read_file", path="calc.py")]),     # sous-agent
+        NS(stop_reason="end_turn", content=[text("add est dans calc.py, ligne 1.")]),          # sous-agent
+        NS(stop_reason="end_turn", content=[text("La fonction add est dans calc.py.")]),       # principal
+    )
+    messages = [{"role": "user", "content": "une vieille demande"}, {"role": "assistant", "content": "ok"}]
+    assert minicode.run_turn(client, messages, "où est add ?") == "La fonction add est dans calc.py."
+
+    sub_first = client.requests[1]
+    assert sub_first["messages"] == [{"role": "user", "content": "Trouve où est définie la fonction add."}]
+    assert sub_first["system"].startswith("Tu es un sous-agent")
+    assert [t["name"] for t in sub_first["tools"]] == ["read_file", "list_dir", "grep"]  # lecture seule, pas de task
+    assert "task" in [t["name"] for t in client.requests[0]["tools"]]
+
+    main_last = client.requests[3]["messages"]
+    report = main_last[-1]["content"][0]
+    assert report["tool_use_id"] == "k1" and report["content"] == "add est dans calc.py, ligne 1."
+    assert "SECRET_DU_FICHIER" not in json.dumps(main_last, default=str)  # le fichier lu est resté chez le sous-agent
+
+
+def test_subagent_cannot_write_and_is_told_to_finish(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(subagent, "MAX_STEPS", 2)
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[task_call()]),
+        NS(stop_reason="tool_use", content=[tool_use("s1", "list_dir", path=".")]),
+        NS(stop_reason="tool_use", content=[tool_use("s2", "edit_file", path="x.py", old_string="", new_string="x")]),
+        NS(stop_reason="end_turn", content=[text("Rapport : rien trouvé.")]),
+        NS(stop_reason="end_turn", content=[text("Rien.")]),
+    )
+    minicode.run_turn(client, [], "cherche", confirm=must_not_ask)
+    assert not (tmp_path / "x.py").exists()
+    refused = client.requests[3]["messages"][-1]["content"]
+    assert refused[0]["is_error"] and "lecture seule" in refused[0]["content"]
+    assert refused[-1] == {"type": "text", "text": subagent.FINISH_NOW}  # dernière étape : écris ton rapport
+    assert client.requests[4]["messages"][-1]["content"][0]["content"] == "Rapport : rien trouvé."
+
+
+def test_subagent_that_never_reports_is_stopped(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(subagent, "MAX_STEPS", 1)
+    looping = NS(stop_reason="tool_use", content=[tool_use("s", "list_dir", path=".")])
+    client = FakeClient(NS(stop_reason="tool_use", content=[task_call()]), looping, looping,
+                        NS(stop_reason="end_turn", content=[text("Tant pis.")]))
+    minicode.run_turn(client, [], "cherche")
+    result = client.requests[3]["messages"][-1]["content"][0]
+    assert result["is_error"] and "sous-agent arrêté" in result["content"]
+
+
+def test_task_without_prompt_is_rejected_before_running(monkeypatch):
+    client = FakeClient(NS(stop_reason="tool_use", content=[tool_use("k", "task", description="x")]),
+                        NS(stop_reason="end_turn", content=[text("ok")]))
+    minicode.run_turn(client, [], "cherche")
+    assert len(client.requests) == 2  # pas d'appel de sous-agent
+    assert "prompt" in client.requests[1]["messages"][-1]["content"][0]["content"]
+
+
+def test_subagent_calls_do_not_change_the_toolbar_context(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    ui = TerminalUI()
+    usage = lambda n: NS(input_tokens=n, cache_read_input_tokens=0, output_tokens=5)
+    client = FakeClient(NS(stop_reason="tool_use", content=[task_call()], usage=usage(3000)),
+                        NS(stop_reason="end_turn", content=[text("rapport")], usage=usage(900)),
+                        NS(stop_reason="end_turn", content=[text("fini")], usage=usage(3100)))
+    minicode.run_turn(client, [], "cherche", ui=ui)
+    assert ui.calls == 3 and ui.context_tokens == 3100

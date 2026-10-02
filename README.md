@@ -79,7 +79,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 6. Contexte projet : les `AGENTS.md` du projet (et des dossiers parents) dans le prompt système, `/init`, `/agents`
 - [x] 7. Streaming (réflexion 💭 + réponse en direct, tokens par appel) + journal JSONL + `show_trace.py`
 - [x] 8. Gestion du contexte : compter les tokens, effacer les vieux résultats d'outils, résumer les vieux tours (`/context`, `/compact`)
-- [ ] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte
+- [x] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte (lecture seule, seul le rapport revient)
 - [ ] 10. Évals : 10 petites tâches, score de réussite / nombre de tours / coût
 
 ## Étapes 4–5 : l'agent agit, le harness contrôle
@@ -397,6 +397,55 @@ au lieu de modifier les anciens, pour que cette copie reste intacte.
   regarde quand le harness efface, puis résume.
 - Fais `/compact`, puis lis le résumé dans le journal : qu'est-ce que qwen3 a oublié ?
 - Pourquoi effacer le contenu d'un `tool_result` plutôt que supprimer la paire `tool_use`/`tool_result` ?
+
+## Étape 9 : les sous-agents (outil `task`)
+
+Pour répondre à « comment marchent les permissions ? », l'agent lit plusieurs fichiers.
+Ces fichiers restent ensuite dans **son** historique, et la fenêtre de 8k se remplit de texte
+dont il n'a plus besoin. L'idée : **déléguer**. L'outil `task` lance une deuxième boucle
+d'agent (la même qu'à l'étape 3) avec :
+
+- un historique **vide** : juste la consigne écrite par l'agent principal ;
+- son propre prompt système (+ les `AGENTS.md`), et seulement `read_file`, `list_dir`, `grep` ;
+- 12 appels au maximum. Au dernier, minicode lui dit « écris ton rapport maintenant ».
+
+Le sous-agent lit ce qu'il veut. À la fin, **seul son rapport** devient le `tool_result` de
+`task` ; tout le reste est jeté. Ce n'est ni un autre modèle ni un autre programme : même
+modèle, même client, même code de boucle. **Un sous-agent, c'est juste une autre liste
+`messages`** (→ `run_subagent()` dans `minicode.py`, `subagent.py`).
+
+```
+⏺ Task(Trouver la gestion des permissions)
+  ⎿  sous-agent : Trouver la gestion des permissions (historique vide, lecture seule)
+     ↳ Search("check_permission|allow|deny" dans .)
+     ✓ terminé en 2 appel(s) au modèle
+  ⎿  rapport du sous-agent : 16 lignes (seul ce rapport entre dans le contexte)
+```
+
+Le journal le montre bien (`uv run show_trace.py`) : l'appel du sous-agent part avec
+**1 message**, sans la conversation principale, et l'agent principal ne reçoit que le rapport.
+
+```
+── appel 1  1 messages envoyés · 2239 tokens       ← tool_use task({...})
+── appel 2 (sous-agent)  1 messages envoyés · 991 tokens
+── appel 3 (sous-agent)  3 messages envoyés · 1636 tokens   ← texte : **RAPPORT** …
+── appel 4  3 messages envoyés · 2819 tokens       ← tool_result : **RAPPORT** …
+```
+
+Choix de conception :
+- **Lecture seule**, sans permission à demander : l'agent principal ne voit pas ce que fait
+  le sous-agent, et tu verrais ses demandes hors contexte. Moins de pouvoirs = moins de dégâts.
+- **Pas de `task` pour le sous-agent** : pas de sous-sous-agents à l'infini.
+- **Le sous-agent ne voit pas la conversation** : la description de l'outil insiste pour que
+  l'agent principal écrive une consigne complète. C'est la principale source d'erreurs.
+- Son texte n'est **pas affiché** (c'est un rapport pour l'agent principal), et ses appels ne
+  changent pas le contexte affiché en bas : il a son propre budget (étape 8).
+
+**Exercices :**
+- Pose la même question avec et sans « utilise task », puis compare le contexte avec `/context`.
+- Lis la consigne écrite par qwen3 pour le sous-agent (`show_trace.py --call 2`) : est-elle
+  assez complète pour quelqu'un qui n'a pas vu la conversation ?
+- Que faudrait-il changer pour qu'un sous-agent puisse lancer les tests (`bash`) sans danger ?
 
 ## Exercices pour les étapes 1–3
 
