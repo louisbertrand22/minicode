@@ -81,7 +81,7 @@ def main():
               f"{total} tokens (dont {cached} en cache) → {usage.get('output_tokens', '?')} tokens · "
               f"{call['seconds']} s · stop={call['stop_reason']}")
         if len(sent) < seen:
-            print(f"{DIM}   (historique plus court qu'avant : nouvelle conversation ou demande annulée){RESET}")
+            print(f"{DIM}   (historique plus court qu'avant : nouvelle conversation, demande annulée ou contexte résumé){RESET}")
             seen = 0
         for message in sent[seen:]:  # seulement ce qui est NOUVEAU depuis l'appel précédent
             for line in describe_message(message):

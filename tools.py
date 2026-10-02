@@ -26,7 +26,9 @@ from pathlib import Path
 # d'en sortir. `bash`, lui, peut tout faire : d'où la permission demandée avant.
 WORKSPACE = Path.cwd().resolve()
 
-MAX_OUTPUT_CHARS = 20_000  # on ne met pas un fichier de 5 Mo dans le contexte
+# On ne met pas un fichier de 5 Mo dans le contexte. minicode.py abaisse ce plafond selon
+# la taille de la fenêtre de contexte (étape 8, voir context.output_limit).
+MAX_OUTPUT_CHARS = 20_000
 MAX_GREP_MATCHES = 100
 MAX_EDIT_LINES = 15  # un old_string plus long = le modèle essaie de recopier tout le fichier
 BASH_TIMEOUT = 60  # secondes ; une commande bloquée ne doit pas figer l'agent
@@ -52,7 +54,7 @@ def _resolve(path: str) -> Path:
     return p
 
 
-def read_file(path: str) -> str:
+def read_file(path: str, start_line: int = 1) -> str:
     p = _resolve(path)
     if not p.is_file():
         raise ToolError(f"Fichier introuvable : {path}")
@@ -60,10 +62,26 @@ def read_file(path: str) -> str:
     if not text.strip():
         # Un résultat vide est ambigu pour le modèle ; on le dit explicitement.
         return "(fichier vide : pour l'écrire, utilise edit_file avec old_string='')"
-    if len(text) > MAX_OUTPUT_CHARS:
-        text = text[:MAX_OUTPUT_CHARS] + f"\n... [tronqué, {len(text)} caractères au total]"
-    # Numéroter les lignes aide le modèle à citer / éditer précisément.
-    return "\n".join(f"{i:>5}\t{line}" for i, line in enumerate(text.splitlines(), 1))
+    lines = text.splitlines()
+    start = max(1, int(start_line))
+    if start > len(lines):
+        raise ToolError(f"{path} n'a que {len(lines)} lignes.")
+    # Étape 8 : un gros fichier se lit par MORCEAUX de lignes entières, au lieu d'être
+    # coupé au milieu ; le modèle sait où reprendre. Numéroter les lignes l'aide aussi
+    # à citer / éditer précisément.
+    out, size = [], 0
+    for n in range(start, len(lines) + 1):
+        line = f"{n:>5}\t{lines[n - 1]}"[:MAX_OUTPUT_CHARS]
+        if out and size + len(line) > MAX_OUTPUT_CHARS:
+            break
+        out.append(line)
+        size += len(line) + 1
+    last = start + len(out) - 1
+    if last < len(lines):
+        out.append(f"... [lignes {start}-{last} sur {len(lines)}. Suite : read_file avec start_line={last + 1}]")
+    elif start > 1:
+        out.append(f"... [lignes {start}-{last} sur {len(lines)} : fin du fichier]")
+    return "\n".join(out)
 
 
 def list_dir(path: str = ".") -> str:
@@ -423,11 +441,15 @@ TOOL_SCHEMAS = [
         "name": "read_file",
         "description": (
             "Lit un fichier texte du projet et renvoie son contenu avec les numéros de ligne. "
-            "Le chemin est relatif à la racine du projet."
+            "Le chemin est relatif à la racine du projet. Un gros fichier est renvoyé par morceaux : "
+            "la fin du résultat indique le start_line pour lire la suite."
         ),
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "Chemin relatif, ex: src/main.py"}},
+            "properties": {
+                "path": {"type": "string", "description": "Chemin relatif, ex: src/main.py"},
+                "start_line": {"type": "integer", "description": "Optionnel : 1re ligne à lire (pour la suite d'un gros fichier)"},
+            },
             "required": ["path"],
             "additionalProperties": False,
         },
@@ -577,8 +599,12 @@ def validate_input(name: str, tool_input) -> None:
     for key in schema["required"]:
         if not isinstance(tool_input.get(key), str):
             raise ToolError(f"Argument manquant ou invalide pour {name} : {key} (texte attendu)")
-    for key, value in tool_input.items():  # les arguments optionnels aussi doivent être du texte
-        if not isinstance(value, str):
+    for key, value in tool_input.items():  # les arguments optionnels aussi doivent avoir le bon type
+        if schema["properties"][key].get("type") == "integer":
+            # Un petit modèle écrit parfois "151" au lieu de 151 : on accepte les deux.
+            if isinstance(value, bool) or not (isinstance(value, int) or str(value).strip().isdigit()):
+                raise ToolError(f"Argument invalide pour {name} : {key} (nombre entier attendu)")
+        elif not isinstance(value, str):
             raise ToolError(f"Argument invalide pour {name} : {key} (texte attendu)")
 
 

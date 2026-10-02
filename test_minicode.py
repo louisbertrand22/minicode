@@ -7,6 +7,9 @@ import json
 import re
 from types import SimpleNamespace as NS
 
+import anthropic
+
+import context
 import minicode
 import permissions
 import tools
@@ -572,3 +575,121 @@ def test_harness_hints_stay_visible_when_output_is_cut(capsys):
     out = plain(capsys.readouterr().out)
     assert "… +16 lignes" in out
     assert "[indice minicode : utilise stdin]" in out and "[code de sortie : 1]" in out
+
+
+# --- Étape 8 : gestion du contexte -------------------------------------------------------
+
+
+def small_budget(monkeypatch, window):
+    """Une toute petite fenêtre, pour déclencher la gestion du contexte avec peu de texte."""
+    budget = context.Budget(window, "", [])
+    monkeypatch.setattr(minicode, "BUDGET", budget)
+    return budget
+
+
+def test_big_file_is_read_in_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(tools, "MAX_OUTPUT_CHARS", 200)
+    (tmp_path / "big.py").write_text("".join(f"x = {i}\n" for i in range(1, 101)))
+    first = tools.read_file("big.py")
+    assert first.splitlines()[0].endswith("x = 1")
+    assert "Suite : read_file avec start_line=" in first  # le modèle sait où reprendre
+    nxt = int(first.rsplit("start_line=", 1)[1].rstrip("]"))
+    second, is_error = tools.run_tool("read_file", {"path": "big.py", "start_line": str(nxt)})  # "12" accepté
+    assert not is_error and second.splitlines()[0].endswith(f"x = {nxt}")
+    assert tools.run_tool("read_file", {"path": "big.py", "start_line": "abc"})[1]
+    assert "n'a que 100 lignes" in tools.run_tool("read_file", {"path": "big.py", "start_line": 500})[0]
+
+
+def test_output_limit_follows_the_window():
+    assert context.output_limit(8192) < 8192 * context.CHARS_PER_TOKEN * 0.25
+    assert context.output_limit(200_000) == 20_000
+
+
+def test_old_tool_results_are_cleared_but_tool_uses_kept():
+    def result_msg(id):
+        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "z" * 500}]}
+    messages = [{"role": "user", "content": "go"}]
+    for id in ("a", "b", "c"):
+        messages += [{"role": "assistant", "content": [tool_use(id, "read_file", path=f"{id}.py")]}, result_msg(id)]
+    snapshot = list(messages)
+    assert context.clear_old_tool_results(messages, keep=2) == 1
+    assert messages[2]["content"][0]["content"] == context.CLEARED
+    assert messages[2]["content"][0]["tool_use_id"] == "a"   # le lien tool_use ↔ tool_result reste valide
+    assert messages[4]["content"][0]["content"] == "z" * 500  # les 2 derniers sont intacts
+    assert snapshot[2]["content"][0]["content"] == "z" * 500  # la copie (pour annuler) n'est pas touchée
+    assert context.clear_old_tool_results(messages, keep=2) == 0  # déjà fait
+
+
+def test_budget_calibrates_on_real_token_count():
+    budget = context.Budget(1000, "", [])
+    messages = [{"role": "user", "content": "a" * 300}]
+    raw = budget.estimate(messages)
+    budget.calibrate(messages, raw * 2)  # le serveur compte 2x plus que notre estimation
+    assert budget.ratio == 1.5           # borné, pour qu'une mesure bizarre ne fausse pas tout
+    assert budget.estimate(messages) == int(raw * 1.5)
+
+
+def test_tool_results_are_cleared_mid_turn(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(tools, "WORKSPACE", tmp_path)
+    for name in ("a", "b", "c"):
+        (tmp_path / f"{name}.py").write_text(f"# fichier {name}\n" * 40)
+    small_budget(monkeypatch, 1000)
+    client = FakeClient(
+        NS(stop_reason="tool_use", content=[tool_use("t1", "read_file", path="a.py")]),
+        NS(stop_reason="tool_use", content=[tool_use("t2", "read_file", path="b.py")]),
+        NS(stop_reason="tool_use", content=[tool_use("t3", "read_file", path="c.py")]),
+        NS(stop_reason="end_turn", content=[text("Lu.")]),
+    )
+    assert minicode.run_turn(client, [], "lis a, b et c") == "Lu."
+    last = client.requests[-1]["messages"]
+    results = [m["content"][0]["content"] for m in last if m["role"] == "user" and isinstance(m["content"], list)]
+    assert results[0] == context.CLEARED and "fichier c" in results[-1]
+    assert "résultat(s) d'outil effacé(s)" in plain(capsys.readouterr().out)
+
+
+def test_old_turns_are_summarized(monkeypatch, capsys):
+    small_budget(monkeypatch, 200)
+    client = FakeClient(
+        NS(stop_reason="end_turn", content=[text("b" * 300)]),
+        NS(stop_reason="end_turn", content=[text("Résumé : l'utilisateur a demandé des a.")]),  # l'appel de résumé
+        NS(stop_reason="end_turn", content=[text("Voilà.")]),
+    )
+    messages = []
+    minicode.run_turn(client, messages, "a" * 300)
+    assert minicode.run_turn(client, messages, "et ensuite ?") == "Voilà."
+
+    summary_request = client.requests[1]
+    assert "tools" not in summary_request             # un simple appel texte, sans outils
+    assert "bbbb" in summary_request["messages"][0]["content"]  # trop long : on garde la fin
+    sent = client.requests[2]["messages"]
+    assert [m["role"] for m in sent] == ["user", "assistant", "user"]  # les rôles alternent toujours
+    assert sent[0]["content"].startswith(context.SUMMARY_PREFIX) and "demandé des a" in sent[0]["content"]
+    assert sent[2]["content"] == "et ensuite ?"       # la demande en cours n'est jamais résumée
+    out = plain(capsys.readouterr().out)
+    assert "remplacés par un résumé" in out and "Résumé :" not in out  # le résumé n'est pas affiché
+
+
+def test_failed_summary_falls_back_to_request_list(monkeypatch):
+    small_budget(monkeypatch, 200)
+
+    class BrokenSummaryClient(FakeClient):
+        def _stream(self, **kwargs):
+            if "tools" not in kwargs:  # l'appel de résumé
+                raise anthropic.APIConnectionError(request=None)
+            return super()._stream(**kwargs)
+
+    client = BrokenSummaryClient(NS(stop_reason="end_turn", content=[text("b" * 300)]),
+                                 NS(stop_reason="end_turn", content=[text("ok")]))
+    messages = []
+    minicode.run_turn(client, messages, "corrige " + "a" * 300)
+    assert minicode.run_turn(client, messages, "merci") == "ok"
+    assert "- corrige aaa" in messages[0]["content"]
+
+
+def test_transcript_keeps_the_most_recent_part():
+    messages = [{"role": "user", "content": context.SUMMARY_PREFIX + "ancien résumé"},
+                {"role": "assistant", "content": context.SUMMARY_ACK}]
+    messages += [{"role": "user", "content": f"demande {i} " + "x" * 50} for i in range(50)]
+    out = context.transcript(messages, 500)
+    assert len(out) <= 500 and "ancien résumé" in out and "demande 49" in out and "demande 0 " not in out

@@ -11,6 +11,9 @@
                       règle de .minicode/permissions.json décide (voir permissions.py).
   7. Streaming + journal -> la réponse s'affiche au fil de l'eau, et chaque échange est
                       enregistré dans .minicode/traces/ (voir tracelog.py, show_trace.py).
+  8. Contexte      -> avant chaque appel, on estime la taille de ce qu'on envoie ; si
+                      la fenêtre du modèle va déborder, on efface les vieux résultats
+                      d'outils, puis on résume les anciens tours (voir context.py).
 
 Tout l'affichage (façon Claude Code) est dans ui.py : ce fichier-ci ne contient
 que le harness, et appelle `ui.xxx()` pour montrer ce qui se passe.
@@ -31,7 +34,9 @@ import time
 
 import anthropic
 
+import context
 import permissions
+import tools
 from tools import DANGEROUS_TOOLS, PROTECTED_DIR, TOOL_SCHEMAS, WORKSPACE, precheck, run_tool, stop_all_sessions
 from tracelog import Trace
 from ui import TerminalUI, edit_diff
@@ -47,6 +52,9 @@ MAX_STEPS = 30  # garde-fou : nombre max d'appels au modèle pour UNE demande
 YOLO = os.environ.get("MINICODE_YOLO") == "1"
 SHOW_THINKING = os.environ.get("MINICODE_THINKING", "1") != "0"  # 0 = cacher l'aperçu de la réflexion
 TRACE = os.environ.get("MINICODE_TRACE", "1") != "0"             # 0 = pas de journal
+CONTEXT_WINDOW = context.window_for(PROVIDER)  # MINICODE_CONTEXT_WINDOW pour la changer
+# Étape 8 : un seul résultat d'outil ne doit pas remplir la fenêtre à lui seul.
+tools.MAX_OUTPUT_CHARS = context.output_limit(CONTEXT_WINDOW)
 
 SYSTEM_PROMPT = f"""Tu es minicode, un assistant de programmation qui tourne dans le terminal.
 Tu travailles dans le projet situé à : {WORKSPACE}
@@ -77,6 +85,8 @@ REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui
 NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
 MAX_NUDGES = 1
 MAX_SAME_FAILURES = 3  # au 3e appel identique raté, on arrête la demande
+BUDGET = context.Budget(CONTEXT_WINDOW, SYSTEM_PROMPT, TOOL_SCHEMAS)
+SUMMARY_SYSTEM = "Tu résumes des conversations de travail, fidèlement et brièvement."
 
 _ui = None
 
@@ -85,7 +95,8 @@ def get_ui():
     """L'interface par défaut (créée à la première utilisation)."""
     global _ui
     if _ui is None:
-        _ui = TerminalUI(PROVIDER, MODEL, SHOW_THINKING, history_file=_history_file())
+        _ui = TerminalUI(PROVIDER, MODEL, SHOW_THINKING, history_file=_history_file(),
+                         context_window=CONTEXT_WINDOW)
     return _ui
 
 
@@ -145,10 +156,86 @@ def call_model(client, messages, trace=None, ui=None):
     seconds = time.time() - start
     # Le total grossit à chaque appel (tout l'historique), mais le serveur garde en
     # CACHE le début déjà vu : `input_tokens` ne compte que la partie nouvelle.
-    ui.record_usage(getattr(response, "usage", None))
+    usage = getattr(response, "usage", None)
+    ui.record_usage(usage)
+    if usage is not None:
+        # Étape 8 : le VRAI nombre de tokens corrige nos estimations suivantes.
+        BUDGET.calibrate(messages, ui.context_tokens)
     if trace:
         trace.log_call(messages, response, seconds)
     return response
+
+
+def summarize(client, old_messages, trace=None, ui=None):
+    """ÉTAPE 8 : demande au modèle un résumé de `old_messages` (sans outils, sans historique).
+
+    Le texte de la conversation doit lui-même tenir dans la fenêtre : context.transcript
+    le raccourcit. Si l'appel échoue, on se rabat sur un résumé fabriqué sans modèle.
+    """
+    ui = ui or get_ui()
+    max_chars = int(BUDGET.limit * 0.6 * context.CHARS_PER_TOKEN)
+    request = [{"role": "user", "content": context.SUMMARY_INSTRUCTIONS + context.transcript(old_messages, max_chars)}]
+    start = time.time()
+    try:
+        # Le texte du résumé n'est PAS envoyé à l'affichage : ce n'est pas une réponse pour
+        # l'utilisateur. On montre seulement l'animation (et la réflexion).
+        with ui.model_call() as view, client.messages.stream(
+                model=MODEL, system=SUMMARY_SYSTEM, messages=request, max_tokens=4000) as stream:
+            for event in stream:
+                if event.type == "thinking":
+                    view.on_thinking(event.thinking)
+            response = stream.get_final_message()
+    except (anthropic.APIStatusError, anthropic.APIConnectionError, ValueError) as e:
+        ui.warn(f"(résumé impossible : {e} ; minicode garde juste la liste des demandes)")
+        return context.fallback_summary(old_messages)
+    if trace:
+        trace.log_call(request, response, time.time() - start)
+    summary = "".join(b.text for b in response.content if b.type == "text").strip()
+    return summary or context.fallback_summary(old_messages)
+
+
+def compact(client, messages, end, trace=None, ui=None):
+    """Remplace messages[:end] par un résumé (2 messages). Renvoie le nouvel indice de fin (2)."""
+    ui = ui or get_ui()
+    before = BUDGET.estimate(messages)
+    summary = summarize(client, messages[:end], trace, ui)
+    messages[:end] = context.summary_messages(summary)
+    after = BUDGET.estimate(messages)
+    ui.context_freed(f"{end} anciens messages remplacés par un résumé", before, after)
+    if trace:
+        trace.log_compact("summary", before, after, summary)
+    return 2
+
+
+def fit_context(client, messages, turn_start, trace=None, ui=None):
+    """ÉTAPE 8 : appelé AVANT chaque appel au modèle. Fait de la place si besoin.
+
+    Du moins cher au plus cher. Renvoie le nouvel indice de début de la demande en
+    cours (il change si les tours précédents sont résumés).
+    """
+    ui = ui or get_ui()
+    if not BUDGET.over(messages):
+        return turn_start
+    # 1. Gratuit : les vieux résultats d'outils ont déjà servi.
+    before = BUDGET.estimate(messages)
+    cleared = context.clear_old_tool_results(messages)
+    if cleared:
+        after = BUDGET.estimate(messages)
+        ui.context_freed(f"{cleared} ancien(s) résultat(s) d'outil effacé(s)", before, after)
+        if trace:
+            trace.log_compact("clear_tool_results", before, after)
+    # 2. Un appel au modèle : résumer les tours PRÉCÉDENTS. La demande en cours reste
+    #    intacte : on ne coupe jamais entre un tool_use et son tool_result.
+    if BUDGET.over(messages) and turn_start > 0 and not context.is_summary(messages[:turn_start]):
+        turn_start = compact(client, messages, turn_start, trace, ui)
+    # 3. Dernier recours : la demande en cours est énorme à elle seule.
+    before = BUDGET.estimate(messages)
+    if BUDGET.over(messages) and context.clear_old_tool_results(messages, keep=1):
+        ui.context_freed("seul le dernier résultat d'outil est gardé", before, BUDGET.estimate(messages))
+    if BUDGET.over(messages):
+        ui.warn(f"(contexte toujours trop grand : ~{BUDGET.estimate(messages)}/{CONTEXT_WINDOW} tokens. "
+                "Le modèle risque d'oublier le début ; fais /clear si ses réponses se dégradent.)")
+    return turn_start
 
 
 def ask_permission(name, tool_input, ui=None):
@@ -203,6 +290,7 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
     failed_calls = {}  # appel raté -> nombre de fois, pendant cette demande
 
     for step in range(MAX_STEPS):
+        turn_start = fit_context(client, messages, turn_start, trace, ui)
         try:
             response = call_model(client, messages, trace, ui)
         except ValueError:
@@ -338,11 +426,27 @@ def main():
             ui.reset()
             ui.info("Nouvelle conversation : l'historique envoyé au modèle est vide.")
             continue
+        if user_input == "/context":
+            ui.context_report(CONTEXT_WINDOW, BUDGET.limit, int(BUDGET.fixed * BUDGET.ratio),
+                              {k: int(v * BUDGET.ratio) for k, v in context.breakdown(messages).items()},
+                              BUDGET.estimate(messages))
+            continue
+        if user_input == "/compact":
+            if len(messages) <= 2:
+                ui.info("Rien à résumer.")
+            else:
+                try:
+                    compact(client, messages, len(messages), trace, ui)
+                except KeyboardInterrupt:
+                    ui.warn("Interrompu : la conversation n'a pas été résumée.")
+            continue
         if user_input == "/trace":
             ui.info(f"journal : {trace.path}" if trace else "journal désactivé (MINICODE_TRACE=0)")
             continue
 
-        start, started_at = len(messages), time.time()
+        # Copie de la liste pour pouvoir annuler la demande : un simple indice ne suffit
+        # plus, car l'étape 8 peut résumer le DÉBUT de l'historique pendant la demande.
+        snapshot, started_at = list(messages), time.time()
         calls_before = ui.calls
         try:
             run_turn(client, messages, user_input, trace=trace, ui=ui)
@@ -350,13 +454,13 @@ def main():
         except KeyboardInterrupt:
             # Ctrl-C : on abandonne la demande en cours. L'historique peut être à
             # moitié écrit (un tool_use sans son tool_result) : on l'annule.
-            del messages[start:]
+            messages[:] = snapshot
             ui.warn("Interrompu. La demande a été annulée.")
         except anthropic.AuthenticationError:
             sys.exit("Clé API invalide ou absente : exporte ANTHROPIC_API_KEY.")
         except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
             # Une erreur en plein tour laisse l'historique à moitié écrit : on annule.
-            del messages[start:]
+            messages[:] = snapshot
             ui.error(f"Erreur API : {e} Demande annulée.")
             if PROVIDER == "ollama" and isinstance(e, anthropic.APIConnectionError):
                 ui.error(f"Ollama ne répond pas sur {OLLAMA_URL} : lance `ollama serve`.")

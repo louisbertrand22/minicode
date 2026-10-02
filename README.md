@@ -78,7 +78,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 5. Permissions : o/t/N avant `bash` et `edit_file`, règles allow/deny dans `.minicode/permissions.json`
 - [ ] 6. Contexte projet : charger un `AGENTS.md` dans le prompt système
 - [x] 7. Streaming (réflexion 💭 + réponse en direct, tokens par appel) + journal JSONL + `show_trace.py`
-- [ ] 8. Gestion du contexte : compter les tokens, résumer les vieux tours
+- [x] 8. Gestion du contexte : compter les tokens, effacer les vieux résultats d'outils, résumer les vieux tours (`/context`, `/compact`)
 - [ ] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte
 - [ ] 10. Évals : 10 petites tâches, score de réussite / nombre de tours / coût
 
@@ -306,6 +306,59 @@ jq -r 'select(.type=="call") | .request_messages[-1].content | if type=="array" 
   de ses anciennes réflexions (bloc `thinking`).
 - Avec `--call N`, retrouve dans la requête brute le `tool_use_id` qui relie un `tool_use` à son `tool_result`.
 - Compare la durée de réflexion avec `MINICODE_MODEL=qwen3:4b`.
+
+## Étape 8 : la gestion du contexte
+
+Tout ce qu'on envoie (prompt système + outils + **tout** l'historique) doit tenir dans la
+**fenêtre de contexte** du modèle, réponse comprise : 8 192 tokens avec notre réglage Ollama.
+Le prompt système et les outils en prennent déjà ~2 000. Si ça déborde, Ollama coupe le
+début **en silence** et le modèle oublie sans prévenir. Le harness surveille donc la taille
+avant **chaque** appel (`fit_context()` dans `minicode.py`, le reste dans `context.py`).
+
+**1. Compter.** On ne peut pas compter les tokens exactement sans le modèle, alors on estime :
+nombre de caractères du JSON ÷ 3. Après chaque appel, le serveur donne le **vrai** nombre
+(`usage`) : on en tire un facteur de correction pour les estimations suivantes (`Budget.calibrate`).
+
+**2. Prévenir.** Un résultat d'outil est plafonné à ~20 % de la fenêtre (6 000 caractères
+avec 8k). Un gros fichier se lit **par morceaux** : `read_file` finit par
+`[lignes 1-140 sur 640. Suite : read_file avec start_line=141]`.
+
+**3. Faire de la place**, au-delà de 70 % de la fenêtre (les 30 % restants sont pour la réponse),
+du moins cher au plus cher :
+
+| Étape | Quoi | Coût |
+|---|---|---|
+| a | **Effacer les vieux résultats d'outils** (sauf les 2 derniers). Le `tool_use` reste : le modèle sait ce qu'il a fait, et peut relancer l'outil. | gratuit |
+| b | **Résumer les tours précédents** : un appel au modèle, sans outils, écrit un résumé qui remplace le début de l'historique. La demande en cours n'est jamais résumée : on ne sépare jamais un `tool_use` de son `tool_result`. | 1 appel |
+| c | En dernier recours, ne garder que le dernier résultat d'outil, et prévenir. | gratuit |
+
+Après un résumé, l'historique commence par deux messages : `user` « [Résumé de la
+conversation précédente…] » puis `assistant` « Compris… ». Il en faut deux, pour que les
+rôles continuent d'alterner. Si le résumé échoue, minicode garde au moins la liste des
+demandes et des fichiers (`fallback_summary`).
+
+Ce qui s'affiche :
+
+```
+✻ Contexte allégé : 3 ancien(s) résultat(s) d'outil effacé(s) (~6100 → ~3900 tokens)
+✻ Terminé en 48 s · 6 appel(s) au modèle · contexte 4210/8192 tokens (51 %)
+```
+
+- `/context` montre où partent les tokens (prompt, demandes, outils, réflexion) ;
+- `/compact` force le résumé de toute la conversation ;
+- `MINICODE_CONTEXT_WINDOW=16384` si tu lances `ollama serve` avec un autre `OLLAMA_CONTEXT_LENGTH` ;
+- le journal note chaque compactage (`"type": "compact"`, avec le résumé).
+
+Un détail : comme le début de l'historique peut changer pendant une demande, Ctrl-C ne
+peut plus annuler avec un simple indice (`del messages[start:]`). `main()` garde donc une
+**copie** de la liste avant chaque demande. `clear_old_tool_results` crée de nouveaux `dict`
+au lieu de modifier les anciens, pour que cette copie reste intacte.
+
+**Exercices :**
+- `MINICODE_CONTEXT_WINDOW=4000 uv run minicode.py`, puis demande de lire 3 fichiers :
+  regarde quand le harness efface, puis résume.
+- Fais `/compact`, puis lis le résumé dans le journal : qu'est-ce que qwen3 a oublié ?
+- Pourquoi effacer le contenu d'un `tool_result` plutôt que supprimer la paire `tool_use`/`tool_result` ?
 
 ## Exercices pour les étapes 1–3
 

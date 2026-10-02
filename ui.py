@@ -36,6 +36,8 @@ TOOL_LABELS = {"read_file": "Read", "list_dir": "List", "grep": "Search", "edit_
 SLASH_COMMANDS = {
     "/help": "afficher cette aide",
     "/clear": "nouvelle conversation (vide l'historique envoyé au modèle)",
+    "/context": "ce qui occupe la fenêtre de contexte",
+    "/compact": "résumer la conversation pour libérer du contexte",
     "/trace": "chemin du journal de la session",
     "/exit": "quitter (ou Ctrl-D)",
 }
@@ -158,9 +160,10 @@ class StreamView:
 
 
 class TerminalUI:
-    def __init__(self, provider="", model="", show_thinking=True, history_file=None):
+    def __init__(self, provider="", model="", show_thinking=True, history_file=None, context_window=None):
         self.console = Console(highlight=False)
         self.provider, self.model = provider, model
+        self.context_window = context_window
         self.show_thinking = show_thinking
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self.context_tokens = self.cached_tokens = 0
@@ -181,8 +184,14 @@ class TerminalUI:
         self.console.print(Panel(body, border_style=ACCENT, expand=False))
         self.console.print()
 
+    def _context_text(self):
+        if not self.context_window:
+            return f"contexte {self.context_tokens} tokens ({self.cached_tokens} en cache)"
+        percent = 100 * self.context_tokens // self.context_window
+        return f"contexte {self.context_tokens}/{self.context_window} tokens ({percent} %)"
+
     def _toolbar(self):
-        context = f"contexte {self.context_tokens} tokens ({self.cached_tokens} en cache)" if self.calls else "nouvelle conversation"
+        context = self._context_text() if self.calls else "nouvelle conversation"
         return f" {self.provider} / {self.model} · {context} · /help"
 
     def read_input(self):
@@ -228,12 +237,31 @@ class TerminalUI:
 
     def turn_done(self, calls, seconds):
         self.console.print(Text(f"✻ Terminé en {seconds:.0f} s · {calls} appel(s) au modèle · "
-                                f"contexte {self.context_tokens} tokens ({self.cached_tokens} en cache)",
-                                style="dim"))
+                                f"{self._context_text()}", style="dim"))
         self.console.print()
 
     def reset(self):
         self.context_tokens = self.cached_tokens = self.calls = 0
+
+    # --- contexte (étape 8) ----------------------------------------------------------
+
+    def context_freed(self, what, before, after):
+        self.console.print(Text(f"✻ Contexte allégé : {what} (~{before} → ~{after} tokens)", style=ACCENT))
+
+    def context_report(self, window, limit, fixed, parts, total):
+        """La commande /context : où partent les tokens, en barres."""
+        table = Table.grid(padding=(0, 2))
+        rows = {"prompt système + outils": fixed, **parts}
+        for name, tokens in rows.items():
+            bar = "█" * round(30 * tokens / window)
+            table.add_row(name, Text(f"~{tokens:>6}", style="bold"), Text(bar or "·", style=ACCENT))
+        table.add_row("", "", "")
+        table.add_row("total estimé", Text(f"~{total:>6}", style="bold"), f"{100 * total // window} % de {window}")
+        if self.calls:
+            table.add_row("mesuré au dernier appel", Text(f"{self.context_tokens:>7}", style="bold"), "")
+        self.console.print(Panel(Group(table, Text(), Text(
+            f"Au-delà de {limit} tokens ({round(100 * limit / window)} %), minicode efface les vieux résultats "
+            "d'outils, puis résume les anciens tours.", style="dim")), title="contexte", border_style=ACCENT, expand=False))
 
     # --- outils -----------------------------------------------------------------
 

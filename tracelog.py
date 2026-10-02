@@ -53,3 +53,8 @@ class Trace:
             "stop_reason": response.stop_reason,
             "usage": usage,
         })
+
+    def log_compact(self, how, tokens_before, tokens_after, summary=None):
+        """Étape 8 : le harness a fait de la place dans l'historique (voir context.py)."""
+        self._write({"type": "compact", "ts": time.time(), "how": how,
+                     "tokens_before": tokens_before, "tokens_after": tokens_after, "summary": summary})
