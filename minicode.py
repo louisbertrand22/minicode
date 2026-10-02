@@ -96,6 +96,11 @@ _agents_fingerprint = None
 AGENTS_MAX_CHARS = max(2_000, min(20_000, int(CONTEXT_WINDOW * 0.10 * context.CHARS_PER_TOKEN)))
 
 REFUSED = "L'utilisateur a refusé cette action. Ne la retente pas ; demande-lui comment il veut procéder."
+# Une règle deny n'est PAS l'utilisateur : il n'a rien vu passer. Le modèle ne doit ni lui
+# demander « comment procéder » pour ça, ni contourner la règle avec une commande équivalente.
+DENIED_BY_RULE = ("Action interdite par la règle de permission {rule} (.minicode/permissions.json), "
+                  "pas par l'utilisateur. Ne la retente pas et ne la contourne pas avec une commande "
+                  "équivalente : fais autrement, ou explique à l'utilisateur ce qui est bloqué.")
 # Les petits modèles finissent parfois leur tour avec seulement de la réflexion
 # (bloc thinking) : ni outil, ni texte. Le harness les relance une fois.
 NUDGE = "Tu n'as rien répondu. Continue : utilise un outil si tu dois agir, sinon donne ta réponse."
@@ -340,19 +345,19 @@ def run_subagent(client, tool_input, trace=None, ui=None):
 def ask_permission(name, tool_input, ui=None):
     """ÉTAPE 5 : c'est le harness, pas le modèle, qui décide si une action a lieu.
 
-    Renvoie (autorisé, consigne de l'utilisateur ou None).
+    Renvoie (autorisé, consigne de l'utilisateur ou None, règle deny qui bloque ou None).
+    Le refus vient de l'utilisateur OU d'une règle : le modèle doit savoir lequel.
     """
     ui = ui or get_ui()
     decision, reason = permissions.decide(name, tool_input)
     if decision == "deny":  # une interdiction l'emporte sur tout, même sur YOLO
-        ui.error(f"✗ interdit par la règle {reason}")
-        return False, None
+        return False, None, reason  # affiché sous l'appel : « ⎿ interdit par la règle … »
     if decision == "allow":
         ui.info(f"✓ autorisé par la règle {reason}")
-        return True, None
+        return True, None, None
     if YOLO:
         ui.info("(MINICODE_YOLO=1 : accepté automatiquement)")
-        return True, None
+        return True, None, None
     if reason:  # ex : commande composée
         ui.info(f"({reason})")
 
@@ -361,7 +366,7 @@ def ask_permission(name, tool_input, ui=None):
     if answer == "always":
         permissions.add_allow_rule(rule)
         ui.info(f"règle ajoutée dans {permissions.rules_file()} : {rule}")
-    return answer in ("yes", "always"), feedback
+    return answer in ("yes", "always"), feedback, None
 
 
 def run_turn(client, messages, user_input, confirm=None, trace=None, ui=None):
@@ -426,7 +431,7 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                 # Le modèle DEMANDE un outil ; c'est nous qui l'exécutons.
                 ui.tool_call(block.name, block.input)
                 diff = _diff_before_edit(block.name, block.input)
-                allowed, feedback = True, None
+                allowed, feedback, rule = True, None, None
                 if block.name == "task":
                     problem = subagent.validate(block.input)
                 else:
@@ -437,7 +442,9 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                 else:
                     if block.name in DANGEROUS_TOOLS:
                         answer = confirm(block.name, block.input)
-                        allowed, feedback = answer if isinstance(answer, tuple) else (answer, None)
+                        # booléen, (autorisé, consigne) ou (autorisé, consigne, règle) : on complète
+                        answer = answer if isinstance(answer, tuple) else (answer,)
+                        allowed, feedback, rule = (*answer, None, None)[:3]
                     if allowed and block.name == "task":
                         # Étape 9 : pas d'outil Python ici, mais une boucle d'agent entière.
                         result, is_error = run_subagent(client, block.input, trace, ui)
@@ -447,7 +454,10 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                     else:
                         # Refus : on ne l'exécute pas, mais on DOIT quand même renvoyer
                         # un tool_result, sinon l'API rejette l'historique.
-                        result = REFUSED + (f" Consigne de l'utilisateur : {feedback}" if feedback else "")
+                        if rule:
+                            result = DENIED_BY_RULE.format(rule=rule)
+                        else:
+                            result = REFUSED + (f" Consigne de l'utilisateur : {feedback}" if feedback else "")
                         is_error = True
                 if is_error and allowed:
                     # Les petits modèles refont parfois EXACTEMENT le même appel raté, en boucle.
@@ -458,8 +468,11 @@ def _agent_loop(client, messages, user_input, confirm, trace, ui):
                                    "de la même façon. Change d'approche.]")
                     if failed_calls[key] >= MAX_SAME_FAILURES:
                         stuck = True
-                ui.tool_result(block.name, block.input, result if allowed else "refusé par l'utilisateur",
-                               is_error, diff)
+                if allowed:
+                    shown = result
+                else:
+                    shown = f"interdit par la règle {rule}" if rule else "refusé par l'utilisateur"
+                ui.tool_result(block.name, block.input, shown, is_error, diff)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,  # relie le résultat à la demande

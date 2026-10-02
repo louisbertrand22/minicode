@@ -113,6 +113,11 @@ au chemin pour `edit_file`. Ordre de décision (voir `permissions.py`) :
 3. **allow** ;
 4. sinon, on demande.
 
+Un refus par une règle n'est pas un refus de l'utilisateur, et le modèle doit le savoir.
+L'écran affiche `⎿ interdit par la règle bash(sudo*)`. Le modèle, lui, reçoit « interdite par la
+règle …, pas par l'utilisateur : ne la contourne pas, fais autrement ». Un refus de ta part
+lui dit au contraire de te demander comment procéder.
+
 L'agent ne peut pas écrire dans `.minicode/` avec `edit_file`, sinon il pourrait s'autoriser
 lui-même. **Limite honnête** : via `bash` (si tu l'autorises), un programme peut toujours écrire
 n'importe où. Des règles de texte ne suffisent pas à sécuriser un agent : les vrais outils

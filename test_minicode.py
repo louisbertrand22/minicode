@@ -501,10 +501,10 @@ def test_answer_always_saves_rule_then_stops_asking(tmp_path, monkeypatch):
     answers = iter(["t"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))  # 2e question = StopIteration
     ui = TerminalUI()
-    assert minicode.ask_permission("bash", PYTEST, ui) == (True, None)
+    assert minicode.ask_permission("bash", PYTEST, ui) == (True, None, None)
     saved = json.loads((tmp_path / ".minicode" / "permissions.json").read_text())
     assert saved == {"allow": ["bash(uv run pytest -q)"], "deny": []}
-    assert minicode.ask_permission("bash", PYTEST, ui) == (True, None)  # la règle répond, plus de question
+    assert minicode.ask_permission("bash", PYTEST, ui) == (True, None, None)  # la règle répond, plus de question
 
 
 def test_deny_beats_yolo(tmp_path, monkeypatch):
@@ -513,8 +513,9 @@ def test_deny_beats_yolo(tmp_path, monkeypatch):
     (tmp_path / ".minicode").mkdir()
     (tmp_path / ".minicode" / "permissions.json").write_text('{"deny": ["bash(git reset --hard*)"]}')
     ui = TerminalUI()
-    assert minicode.ask_permission("bash", {"command": "git reset --hard HEAD~3"}, ui) == (False, None)
-    assert minicode.ask_permission("bash", {"command": "git status"}, ui) == (True, None)
+    assert minicode.ask_permission("bash", {"command": "git reset --hard HEAD~3"}, ui) == \
+        (False, None, "bash(git reset --hard*)")  # la règle en cause est renvoyée
+    assert minicode.ask_permission("bash", {"command": "git status"}, ui) == (True, None, None)
 
 
 # --- Sessions interactives -----------------------------------------------------------
@@ -867,9 +868,12 @@ def test_eval_workspaces_deny_sudo_even_in_yolo_mode(tmp_path, monkeypatch, caps
                         NS(stop_reason="end_turn", content=[text("Je ne peux pas.")]))
     minicode.run_turn(client, [], "installe pytest")
     result = client.requests[1]["messages"][-1]["content"][0]
-    assert result["is_error"] and "refusé" in result["content"]  # rien n'a été exécuté
+    assert result["is_error"] and "interdite par la règle de permission bash(" in result["content"]  # rien n'a été exécuté
+    # C'est une règle, pas l'utilisateur : ni le modèle ni l'écran ne doivent dire le contraire.
+    assert "pas par l'utilisateur" in result["content"] and "L'utilisateur a refusé" not in result["content"]
     out = plain(capsys.readouterr().out)
-    assert "interdit par la règle bash(" in out and "sudo" in out.split("interdit par la règle", 1)[1]
+    assert "⎿  interdit par la règle bash(" in out and "sudo" in out.split("interdit par la règle", 1)[1]
+    assert "refusé par l'utilisateur" not in out
 
 
 def test_there_are_ten_distinct_tasks():
