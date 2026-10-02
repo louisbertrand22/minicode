@@ -169,7 +169,7 @@ class TerminalUI:
         self.show_thinking = show_thinking
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
         self.context_tokens = self.cached_tokens = 0
-        self.calls = 0
+        self.calls = self.tokens_in = self.tokens_out = 0
         self.session = None
         if self.interactive:
             self.session = PromptSession(history=FileHistory(str(history_file)) if history_file else None)
@@ -237,6 +237,10 @@ class TerminalUI:
         if usage is None:
             return
         self.calls += 1
+        # Étape 10 : le total CONSOMMÉ (ce que tu paierais), sous-agents compris.
+        self.tokens_in += (usage.input_tokens + (getattr(usage, "cache_read_input_tokens", 0) or 0)
+                           + (getattr(usage, "cache_creation_input_tokens", 0) or 0))
+        self.tokens_out += getattr(usage, "output_tokens", 0) or 0
         if not update_context:  # appel d'un sous-agent : la barre garde le contexte principal
             return
         self.cached_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0

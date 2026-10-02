@@ -80,7 +80,7 @@ Tests (sans appel API) : `uv run pytest`
 - [x] 7. Streaming (réflexion 💭 + réponse en direct, tokens par appel) + journal JSONL + `show_trace.py`
 - [x] 8. Gestion du contexte : compter les tokens, effacer les vieux résultats d'outils, résumer les vieux tours (`/context`, `/compact`)
 - [x] 9. Sous-agents : un outil `task` qui lance une boucle avec son propre contexte (lecture seule, seul le rapport revient)
-- [ ] 10. Évals : 10 petites tâches, score de réussite / nombre de tours / coût
+- [x] 10. Évals : 10 petites tâches, score de réussite / nombre d'appels / tokens / durée (`evals.py`)
 
 ## Étapes 4–5 : l'agent agit, le harness contrôle
 
@@ -446,6 +446,63 @@ Choix de conception :
 - Lis la consigne écrite par qwen3 pour le sous-agent (`show_trace.py --call 2`) : est-elle
   assez complète pour quelqu'un qui n'a pas vu la conversation ?
 - Que faudrait-il changer pour qu'un sous-agent puisse lancer les tests (`bash`) sans danger ?
+
+## Étape 10 : les évals (`evals.py`)
+
+Quand on change un prompt, un garde-fou ou un modèle, comment savoir si c'est **mieux** ?
+Essayer une fois à la main ne suffit pas : le modèle est aléatoire, et une correction qui aide
+sur un cas peut en casser un autre. Une éval, c'est :
+
+1. des tâches **fixes** : des fichiers de départ + une demande ;
+2. une **vérification automatique** par tâche : le programme corrigé tourne, la réponse contient
+   la bonne valeur, le test n'a pas été modifié (pas de triche)…
+3. des **mesures** : réussite, appels au modèle, tokens consommés (≈ coût), durée.
+
+```bash
+uv run evals.py                         # les 10 tâches (~3 min avec qwen3:8b)
+uv run evals.py -k bug -k jeu           # seulement certaines
+uv run evals.py --repeat 3              # 3 essais par tâche : le modèle est aléatoire
+MINICODE_MODEL=qwen3:4b uv run evals.py # comparer un autre modèle
+```
+
+Chaque tâche tourne dans un **dossier temporaire neuf**, dans un **sous-processus** : minicode
+y démarre comme si tu le lançais là, sans historique, avec `MINICODE_YOLO=1`. Le dossier reçoit
+aussi des règles `deny` (`sudo`, `pip install`, `curl`…) : elles l'emportent même sur YOLO.
+La vérification se fait **après**, depuis `evals.py`. Le score précédent est affiché à côté
+(`.minicode/evals/`), et chaque dossier garde la sortie de minicode et son journal.
+
+Une éval ne vaut que par sa vérification. `test_minicode.py` vérifie donc, pour chaque tâche,
+que le contrôle dit **oui** à une bonne solution et **non** à l'état de départ.
+
+### Premier run : qwen3:8b, 5/10
+
+| tâche | étape | ✓ | appels | tokens | ce qui s'est passé |
+|---|---|---|---|---|---|
+| lire_valeur | 2 | ✗ | 2 | 4 732 | « config.py ne précise pas le port » alors qu'il contient `PORT = 8731` |
+| trouver_fichier | 4 | ✓ | 3 | 6 554 | |
+| corriger_bug | 4 | ✗ | 6 | 21 691 | a lancé `uv run pytest` au lieu de `python3 test_calc.py`, puis a voulu installer pytest… jusqu'à `sudo pacman` ; n'a jamais ouvert `calc.py` |
+| creer_script | 4 | ✓ | 3 | 6 938 | |
+| ajouter_fonction | 4 | ✓ | 4 | 11 085 | |
+| renommer | 4 | ✗ | 5 | 15 643 | a oublié la ligne `import` de `main.py`, puis a vérifié avec pytest (absent) au lieu de lancer le programme |
+| compteur_jeu | 4 | ✗ | 3 | 8 279 | a trouvé le bug… puis a écrit « Appliquez cette correction avec edit_file » au lieu de le faire |
+| memoire | 1 | ✓ | 2 | 4 076 | |
+| agents_md | 6 | ✓ | 4 | 10 741 | |
+| gros_fichier | 8 | ✗ | 3 | 11 098 | a lu les 217 premières lignes, puis « il faudrait lire la suite avec start_line=218 »… sans le faire |
+
+Ce que ça apprend, et qu'aucun essai à la main n'aurait montré aussi clairement :
+- **l'échec le plus fréquent est l'abandon en cours de route** (3 tâches sur 5) : qwen3 décrit
+  l'action suivante au lieu de la faire, et le harness s'arrête car il n'y a plus d'outil demandé ;
+- **la vérification par réflexe** (`pytest`) au lieu de la commande demandée ;
+- **la sécurité** : en mode YOLO, un agent qui bloque essaie d'installer des choses avec `sudo`.
+  D'où les règles `deny` ajoutées après ce run.
+
+**Exercices** (la boucle « changer → mesurer → comparer » ; garde ce qui fait monter le score) :
+- Ajoute au prompt système : « Ne termine jamais en décrivant ce qu'il reste à faire : fais-le ».
+  Combien de tâches récupères-tu ? Attention aux tâches qui réussissaient : restent-elles vertes ?
+- Côté harness : si la réponse finale contient `start_line=` ou « edit_file », relancer une
+  fois le modèle (comme la relance des réponses vides, étape 4). Mieux ou moins bien qu'un prompt ?
+- `--repeat 3` : un score de 5/10 sur un seul essai est-il stable ?
+- Compare `qwen3:4b`, ou Claude (`MINICODE_PROVIDER=anthropic`) : quelles tâches changent ?
 
 ## Exercices pour les étapes 1–3
 

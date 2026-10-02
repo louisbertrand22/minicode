@@ -828,3 +828,31 @@ def test_subagent_calls_do_not_change_the_toolbar_context(tmp_path, monkeypatch)
                         NS(stop_reason="end_turn", content=[text("fini")], usage=usage(3100)))
     minicode.run_turn(client, [], "cherche", ui=ui)
     assert ui.calls == 3 and ui.context_tokens == 3100
+    assert ui.tokens_in == 3000 + 900 + 3100 and ui.tokens_out == 15  # étape 10 : le total consommé
+
+
+# --- Étape 10 : évals ----------------------------------------------------------------------
+
+
+import pytest
+
+import evals
+
+
+@pytest.mark.parametrize("task", evals.TASKS, ids=lambda t: t.name)
+def test_eval_checks_accept_a_good_solution_and_reject_the_start(task, tmp_path):
+    """Une éval ne vaut que par sa vérification : elle doit dire OUI à une bonne solution,
+    et NON quand rien n'a été fait (sinon le score ne mesure rien)."""
+    untouched, solved = tmp_path / "depart", tmp_path / "solution"
+    for workdir in (untouched, solved):
+        workdir.mkdir()
+        evals.setup(task, workdir)
+    for path, content in task.solution.items():
+        (solved / path).write_text(content)
+    good = [task.good_answer] * len(task.prompts)
+    assert task.check(solved, good)[0], task.check(solved, good)[1]
+    assert not task.check(untouched, [""] * len(task.prompts))[0]
+
+
+def test_there_are_ten_distinct_tasks():
+    assert len(evals.TASKS) == 10 and len({t.name for t in evals.TASKS}) == 10
