@@ -544,6 +544,35 @@ prudence : **un seul essai par tâche**, et qwen3 est aléatoire (`lire_valeur` 
 touchée par ces changements, et passe pourtant cette fois). Les deux échecs restants ont la même
 cause, et ce n'est pas un problème de langage : le modèle **décrit** l'action au lieu de la **faire**.
 
+### Troisième run : relancer quand le modèle décrit au lieu de faire, 20/26
+
+Nouveauté du harness (`DO_IT` dans `minicode.py`). Si l'utilisateur demande une **action**, que
+**rien n'a été modifié**, et que la réponse renvoie le travail (« Corrigez… », « Corrigeons… »,
+« il faudrait… », un nom d'outil), minicode rappelle au modèle d'agir, 2 fois au maximum. Si le
+modèle répond alors juste « OK », c'était une simple explication : on garde sa première réponse.
+
+Méthode : d'abord 3 essais sur les 2 tâches visées (**1/6**). Les journaux ont montré que la relance
+marchait, mais que la détection ratait « Corrigeons… » et qu'une relance ne suffisait pas
+toujours. Après ces deux corrections, run complet avec **2 essais par tâche** :
+
+| | résultat |
+|---|---|
+| score | **20/26** (77 %) — le 11/13 précédent n'était qu'un essai par tâche |
+| relances déclenchées | 4 essais sur 26 |
+| sauvées par la relance | 2 (`corriger_js`, `corriger_shell`) |
+| `corriger_shell` | 2/2 (0/1 au 2e run) |
+| `compteur_jeu` | 0/2 : relancé, qwen3 essaie… mais rate l'édition (numéros de ligne recopiés dans `old_string`, indentation cassée) |
+| échecs sans relance | `lire_valeur`, `corriger_bug`, `gros_fichier`, 1 essai sur 2 chacun : le hasard du modèle |
+| abandon non détecté | `corriger_js` : « Voici la démarche pour corriger : 1. … » |
+
+Leçons :
+- **Un score sur 1 essai ne veut presque rien dire** avec un petit modèle : les mêmes tâches
+  passent puis échouent sans qu'on ait rien changé.
+- **Une détection par mots-clés est fragile** : à chaque run, une nouvelle tournure passe à travers.
+  Plus simple et plus robuste : relancer **chaque fois** qu'une demande d'action se termine sans
+  modification (le repli « OK → première réponse » limite le coût).
+- Quand la relance marche, **le problème suivant apparaît** : savoir faire la modification.
+
 **Exercices** (la boucle « changer → mesurer → comparer » ; garde ce qui fait monter le score) :
 - Ajoute au prompt système : « Ne termine jamais en décrivant ce qu'il reste à faire : fais-le ».
   Combien de tâches récupères-tu ? Attention aux tâches qui réussissaient : restent-elles vertes ?
